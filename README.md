@@ -8,13 +8,19 @@ Cloud-ready container images for three independent services:
 
 Each service is deployed separately (one container per service).
 
+## Published images (copy/paste)
+
+- `ghcr.io/foxy1402/container-vpn:socks5`
+- `ghcr.io/foxy1402/container-vpn:http-proxy`
+- `ghcr.io/foxy1402/container-vpn:wireguard`
+
 ## Images and ports
 
 | Image | Purpose | Port |
 |---|---|---|
-| `proxy:socks5` | SOCKS5 with username/password auth | `1080/tcp` |
-| `proxy:http-proxy` | HTTP proxy + HTTPS CONNECT tunnel | `8080/tcp` |
-| `proxy:wireguard` | WireGuard server that auto-generates client configs | `51820/udp` |
+| `ghcr.io/foxy1402/container-vpn:socks5` | SOCKS5 with username/password auth | `1080/tcp` |
+| `ghcr.io/foxy1402/container-vpn:http-proxy` | HTTP proxy + HTTPS CONNECT tunnel | `8080/tcp` |
+| `ghcr.io/foxy1402/container-vpn:wireguard` | WireGuard server that auto-generates client configs | `51820/udp` |
 
 ## Build
 
@@ -57,7 +63,7 @@ docker run -d \
   -p 1080:1080 \
   -e SOCKS5_USER=myuser \
   -e SOCKS5_PASS='strong-password' \
-  proxy:socks5
+  ghcr.io/foxy1402/container-vpn:socks5
 ```
 
 Test:
@@ -91,7 +97,7 @@ docker run -d \
   -p 8080:8080 \
   -e HTTP_PROXY_USER=myuser \
   -e HTTP_PROXY_PASS='strong-password' \
-  proxy:http-proxy
+  ghcr.io/foxy1402/container-vpn:http-proxy
 ```
 
 Test:
@@ -137,7 +143,7 @@ docker run -d \
   -p 51820:51820/udp \
   -e WG_ENDPOINT=vpn.example.com:51820 \
   -v $(pwd)/wireguard-data:/etc/wireguard \
-  proxy:wireguard
+  ghcr.io/foxy1402/container-vpn:wireguard
 ```
 
 Generated client configs:
@@ -165,7 +171,7 @@ These images target Debian 13 slim style environments. Runtime dependencies are 
 
 ## CI build
 
-GitHub workflow file: `.github-workflows-build.yml`
+GitHub workflow file: `.github/workflows/build.yml`
 
 - Builds all three images for `linux/amd64` and `linux/arm64`
 - Pushes to GHCR on non-PR events
