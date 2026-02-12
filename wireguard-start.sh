@@ -40,7 +40,7 @@ ensure_cmd() {
 
 ensure_dependencies() {
     local missing=()
-    for cmd in wg wg-quick ip iptables sysctl; do
+    for cmd in wg wg-quick ip iptables sysctl curl; do
         if ! ensure_cmd "$cmd"; then
             missing+=("$cmd")
         fi
@@ -58,7 +58,7 @@ ensure_dependencies() {
     log "Installing missing dependencies: ${missing[*]}"
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        wireguard-tools iproute2 iptables procps
+        wireguard-tools iproute2 iptables procps curl
     rm -rf /var/lib/apt/lists/*
 }
 
@@ -102,28 +102,24 @@ get_public_endpoint() {
     fi
 
     local detected_ip
-    if ensure_cmd curl; then
-        detected_ip="$(curl -4fsS --max-time 5 https://api.ipify.org || true)"
-    elif ensure_cmd wget; then
-        detected_ip="$(wget -4qO- --timeout=5 https://api.ipify.org || true)"
-    fi
+    local service
+    for service in "https://api.ipify.org" "https://icanhazip.com" "https://ifconfig.me/ip"; do
+        if ensure_cmd curl; then
+            detected_ip="$(curl -4fsS --max-time 5 "$service" 2>/dev/null || true)"
+        elif ensure_cmd wget; then
+            detected_ip="$(wget -4qO- --timeout=5 "$service" 2>/dev/null || true)"
+        else
+            break
+        fi
 
-    if [ -n "$detected_ip" ] && [[ "$detected_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        echo "${detected_ip}:${WG_PORT}"
-        return
-    fi
+        if [ -n "$detected_ip" ] && [[ "$detected_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "${detected_ip}:${WG_PORT}"
+            return
+        fi
+    done
 
-    detected_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
-    if [ -z "$detected_ip" ]; then
-        detected_ip="$(hostname -i 2>/dev/null | awk '{print $1}')"
-    fi
-
-    if [ -z "$detected_ip" ]; then
-        log "ERROR: Could not detect public endpoint. Set WG_ENDPOINT manually (ip-or-host:port)"
-        exit 1
-    fi
-
-    echo "${detected_ip}:${WG_PORT}"
+    log "ERROR: Could not detect public IP. Please set WG_ENDPOINT manually"
+    exit 1
 }
 
 setup_dirs() {
@@ -223,14 +219,29 @@ generate_clients() {
     subnet_prefix="$(extract_prefix_24 "$WG_SERVER_CIDR")"
     server_host_octet="$(extract_host_octet "$WG_SERVER_CIDR")"
     local current_octet=2
+    local allocated_ips=()
 
     for i in $(seq 1 "$WG_CLIENT_COUNT"); do
         local client_name="${WG_CLIENT_PREFIX}${i}"
-        while [ "$current_octet" -eq "$server_host_octet" ] || [ "$current_octet" -eq 255 ]; do
+        local client_ip
+
+        while true; do
+            while [ "$current_octet" -eq "$server_host_octet" ] || [ "$current_octet" -eq 255 ] || [ "$current_octet" -eq 0 ]; do
+                current_octet=$((current_octet + 1))
+                if [ "$current_octet" -gt 254 ]; then
+                    log "ERROR: Ran out of IP addresses in subnet"
+                    exit 1
+                fi
+            done
+
+            client_ip="${subnet_prefix}.${current_octet}"
+            if [[ ! " ${allocated_ips[*]} " =~ " ${client_ip} " ]]; then
+                allocated_ips+=("$client_ip")
+                current_octet=$((current_octet + 1))
+                break
+            fi
             current_octet=$((current_octet + 1))
         done
-        local client_ip="${subnet_prefix}.${current_octet}"
-        current_octet=$((current_octet + 1))
         local client_dir="${WG_CLIENT_DIR}/${client_name}"
 
         mkdir -p "$client_dir"

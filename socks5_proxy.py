@@ -52,7 +52,7 @@ PROXY_PASS = os.getenv("SOCKS5_PASS", "")
 MAX_CONNECTIONS = get_env_int("SOCKS5_MAX_CONN", 200, 1, 10000)
 CONNECTION_TIMEOUT = get_env_int("SOCKS5_TIMEOUT", 15, 3, 300)
 IDLE_TIMEOUT = get_env_int("SOCKS5_IDLE_TIMEOUT", 300, 5, 86400)
-AUTH_FAILURE_LIMIT = get_env_int("SOCKS5_AUTH_FAIL_LIMIT", 8, 1, 100)
+AUTH_FAILURE_LIMIT = get_env_int("SOCKS5_AUTH_FAIL_LIMIT", 5, 1, 100)
 AUTH_FAILURE_WINDOW = get_env_int("SOCKS5_AUTH_FAIL_WINDOW", 60, 1, 3600)
 
 
@@ -75,13 +75,22 @@ class SOCKS5Server:
         signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
-        logger.info("Received signal %s, shutting down", signum)
+        logger.info("Received signal %s, initiating graceful shutdown", signum)
         self.running = False
         if self.server:
             try:
                 self.server.close()
             except OSError:
                 pass
+        grace_period = 30
+        for _ in range(grace_period):
+            with self.conn_lock:
+                if self.active_connections == 0:
+                    break
+            time.sleep(1)
+        with self.conn_lock:
+            if self.active_connections > 0:
+                logger.warning("Force closing %d active connections", self.active_connections)
         self._cleanup_pid_file()
         sys.exit(0)
 
@@ -133,7 +142,10 @@ class SOCKS5Server:
         with self.auth_lock:
             history = [ts for ts in self.auth_failures[ip] if now - ts <= AUTH_FAILURE_WINDOW]
             self.auth_failures[ip] = history
-            return len(history) < AUTH_FAILURE_LIMIT
+            allowed = len(history) < AUTH_FAILURE_LIMIT
+            if not allowed:
+                logger.warning("Rate limit exceeded for %s", ip)
+            return allowed
 
     def _record_auth_failure(self, ip):
         with self.auth_lock:
@@ -144,16 +156,22 @@ class SOCKS5Server:
 
     def _relay(self, client, remote):
         sockets = [client, remote]
-        while True:
-            readable, _, exceptional = select.select(sockets, [], sockets, IDLE_TIMEOUT)
-            if exceptional or not readable:
-                break
-            for source in readable:
-                destination = remote if source is client else client
-                data = source.recv(32768)
-                if not data:
-                    return
-                destination.sendall(data)
+        try:
+            while True:
+                readable, _, exceptional = select.select(sockets, [], sockets, IDLE_TIMEOUT)
+                if exceptional or not readable:
+                    break
+                for source in readable:
+                    destination = remote if source is client else client
+                    try:
+                        data = source.recv(32768)
+                        if not data:
+                            return
+                        destination.sendall(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+        except Exception as exc:
+            logger.debug("Relay error: %s", exc)
 
     def _handle_client(self, client_socket, client_address):
         client_ip = client_address[0]
@@ -171,10 +189,11 @@ class SOCKS5Server:
             methods = self._recv_exact(client_socket, nmethods)
             if not methods:
                 return
-            if 2 not in methods:
+            if 2 in methods:
+                client_socket.sendall(struct.pack("!BB", 5, 2))
+            else:
                 client_socket.sendall(struct.pack("!BB", 5, 255))
                 return
-            client_socket.sendall(struct.pack("!BB", 5, 2))
 
             if not self._check_rate_limit(client_ip):
                 client_socket.sendall(struct.pack("!BB", 1, 1))

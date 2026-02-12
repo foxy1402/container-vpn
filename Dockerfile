@@ -43,7 +43,7 @@ EXPOSE 1080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python3 -c "import os,socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', int(os.getenv('SOCKS5_PORT','1080')))); s.close()"
+    CMD python3 -c "import os,socket,struct; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', int(os.getenv('SOCKS5_PORT','1080')))); s.sendall(struct.pack('!BBB',5,1,0)); g=s.recv(2); s.close(); raise SystemExit(0 if len(g)==2 and g[0]==5 else 1)"
 
 # Run as non-root
 USER appuser

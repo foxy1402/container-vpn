@@ -4,6 +4,7 @@ Threaded HTTP/HTTPS proxy with env-based auth and self-healing startup.
 """
 import base64
 import errno
+import ipaddress
 import logging
 import os
 import select
@@ -56,19 +57,20 @@ PROXY_PASS = os.getenv("HTTP_PROXY_PASS", "")
 MAX_CONNECTIONS = get_env_int("HTTP_MAX_CONN", 200, 1, 10000)
 REQUEST_TIMEOUT = get_env_int("HTTP_PROXY_TIMEOUT", 30, 5, 300)
 IDLE_TIMEOUT = get_env_int("HTTP_PROXY_IDLE_TIMEOUT", 300, 5, 86400)
-AUTH_FAILURE_LIMIT = get_env_int("HTTP_AUTH_FAIL_LIMIT", 8, 1, 100)
+AUTH_FAILURE_LIMIT = get_env_int("HTTP_AUTH_FAIL_LIMIT", 5, 1, 100)
 AUTH_FAILURE_WINDOW = get_env_int("HTTP_AUTH_FAIL_WINDOW", 60, 1, 3600)
 
 
 class ConnectionLimiter:
     def __init__(self, limit):
-        self.limit = limit
         self.semaphore = threading.Semaphore(limit)
 
 
 LIMITER = ConnectionLimiter(MAX_CONNECTIONS)
 AUTH_FAILURES = defaultdict(list)
 AUTH_LOCK = threading.Lock()
+ACTIVE_CONNECTIONS = 0
+ACTIVE_CONNECTIONS_LOCK = threading.Lock()
 
 
 class ProxyHTTPServer(ThreadingMixIn, HTTPServer):
@@ -87,12 +89,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         super().setup()
 
     def handle(self):
+        global ACTIVE_CONNECTIONS
         if not LIMITER.semaphore.acquire(blocking=False):
             self.close_connection = True
             return
+        with ACTIVE_CONNECTIONS_LOCK:
+            ACTIVE_CONNECTIONS += 1
         try:
             super().handle()
         finally:
+            with ACTIVE_CONNECTIONS_LOCK:
+                ACTIVE_CONNECTIONS -= 1
             LIMITER.semaphore.release()
 
     def _is_rate_limited(self, ip):
@@ -100,7 +107,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         with AUTH_LOCK:
             windowed = [ts for ts in AUTH_FAILURES[ip] if now - ts <= AUTH_FAILURE_WINDOW]
             AUTH_FAILURES[ip] = windowed
-            return len(windowed) >= AUTH_FAILURE_LIMIT
+            limited = len(windowed) >= AUTH_FAILURE_LIMIT
+            if limited:
+                logger.warning("Rate limit exceeded for %s", ip)
+            return limited
 
     def _record_auth_failure(self, ip):
         with AUTH_LOCK:
@@ -143,6 +153,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _is_safe_target(self, host):
+        if not host:
+            return False
+
+        host = host.strip().strip("[]").lower()
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return False
+
+        try:
+            ip = ipaddress.ip_address(host)
+            return not (ip.is_private or ip.is_loopback or ip.is_link_local)
+        except ValueError:
+            pass
+
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            for info in infos:
+                addr = info[4][0]
+                ip = ipaddress.ip_address(addr)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    return False
+        except Exception:
+            return False
+
+        return True
+
     def _build_upstream_request(self, method):
         target_url = self.path
         parsed = urllib.parse.urlsplit(target_url)
@@ -151,6 +187,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if not host:
                 raise ValueError("Host header is required")
             target_url = f"http://{host}{self.path}"
+            parsed = urllib.parse.urlsplit(target_url)
+
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("Unsupported URL scheme")
+
+        if not self._is_safe_target(parsed.hostname):
+            raise PermissionError("Target not allowed")
 
         body = None
         if method in ("POST", "PUT", "PATCH"):
@@ -208,26 +251,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if method != "HEAD":
                 self.wfile.write(payload)
+        except PermissionError as exc:
+            self.send_error(403, str(exc))
+        except ValueError as exc:
+            self.send_error(400, str(exc))
         except Exception as exc:
             logger.error("%s %s failed: %s", method, self.path, exc)
             self.send_error(502, f"Bad Gateway: {exc}")
 
     def _relay_bidirectional(self, client, upstream):
         sockets = [client, upstream]
-        while True:
-            readable, _, exceptional = select.select(sockets, [], sockets, IDLE_TIMEOUT)
-            if exceptional or not readable:
-                break
-            for source in readable:
-                destination = upstream if source is client else client
-                data = source.recv(32768)
-                if not data:
-                    return
-                destination.sendall(data)
+        try:
+            while True:
+                readable, _, exceptional = select.select(sockets, [], sockets, IDLE_TIMEOUT)
+                if exceptional or not readable:
+                    break
+                for source in readable:
+                    destination = upstream if source is client else client
+                    try:
+                        data = source.recv(32768)
+                        if not data:
+                            return
+                        destination.sendall(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+        except Exception as exc:
+            logger.debug("Relay error: %s", exc)
 
     def do_CONNECT(self):
         if not self._check_auth():
             return
+
+        self.connection.settimeout(10)
 
         upstream = None
         try:
@@ -237,6 +292,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 host, port_text = target.rsplit(":", 1)
             port = int(port_text)
+            blocked_ports = {22, 23, 25, 3306, 5432, 6379, 27017}
+            if port in blocked_ports:
+                self.send_error(403, "Port not allowed")
+                return
+            if port < 1 or port > 65535:
+                self.send_error(400, "Invalid port")
+                return
+            if not self._is_safe_target(host):
+                self.send_error(403, "Target not allowed")
+                return
+
             upstream = socket.create_connection((host, port), timeout=REQUEST_TIMEOUT)
             upstream.settimeout(IDLE_TIMEOUT)
 
@@ -292,10 +358,20 @@ class ProxyApp:
         signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
-        logger.info("Received signal %s, shutting down", signum)
+        logger.info("Received signal %s, initiating graceful shutdown", signum)
         self.running = False
         if self.server:
             self.server.shutdown()
+        grace_period = 30
+        for _ in range(grace_period):
+            with ACTIVE_CONNECTIONS_LOCK:
+                if ACTIVE_CONNECTIONS == 0:
+                    break
+            time.sleep(1)
+        with ACTIVE_CONNECTIONS_LOCK:
+            if ACTIVE_CONNECTIONS > 0:
+                logger.warning("Force closing %d active connections", ACTIVE_CONNECTIONS)
+        if self.server:
             self.server.server_close()
 
     def _cleanup_stale_pid_file(self):
