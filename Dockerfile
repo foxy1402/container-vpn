@@ -11,12 +11,7 @@ LABEL service.type="socks5"
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         python3 \
-        python3-pip \
-        iproute2 \
-        procps \
-        lsof \
         ca-certificates && \
-    pip3 install --no-cache-dir --break-system-packages psutil && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -36,8 +31,8 @@ RUN useradd -r -u 1000 -s /bin/false appuser && \
 # Environment variables
 ENV SOCKS5_HOST=0.0.0.0 \
     SOCKS5_PORT=1080 \
-    SOCKS5_USER=user \
-    SOCKS5_PASS=pass \
+    SOCKS5_USER= \
+    SOCKS5_PASS= \
     SOCKS5_MAX_CONN=50 \
     SOCKS5_TIMEOUT=30 \
     SOCKS5_IDLE_TIMEOUT=300 \
@@ -48,7 +43,7 @@ EXPOSE 1080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', int('${SOCKS5_PORT}'))); s.close()" || exit 1
+    CMD python3 -c "import os,socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', int(os.getenv('SOCKS5_PORT','1080')))); s.close()"
 
 # Run as non-root
 USER appuser

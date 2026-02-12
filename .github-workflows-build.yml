@@ -76,4 +76,28 @@ jobs:
         run: |
           echo "Testing ${{ matrix.service.name }} image..."
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }}
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }} --version || true
+          case "${{ matrix.service.name }}" in
+            socks5)
+              cid=$(docker run -d \
+                -e SOCKS5_USER=testuser \
+                -e SOCKS5_PASS=testpass \
+                -p 127.0.0.1:11080:1080 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
+              sleep 3
+              docker exec "$cid" python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1',1080)); s.close()"
+              docker rm -f "$cid"
+              ;;
+            http-proxy)
+              cid=$(docker run -d \
+                -e HTTP_PROXY_USER=testuser \
+                -e HTTP_PROXY_PASS=testpass \
+                -p 127.0.0.1:18080:8080 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
+              sleep 3
+              docker exec "$cid" python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1',8080)); s.close()"
+              docker rm -f "$cid"
+              ;;
+            wireguard)
+              docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }} >/dev/null
+              ;;
+          esac

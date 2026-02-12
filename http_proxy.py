@@ -1,218 +1,386 @@
 #!/usr/bin/env python3
 """
-HTTP/HTTPS Proxy Server
-Production-ready with authentication and self-healing
+Threaded HTTP/HTTPS proxy with env-based auth and self-healing startup.
 """
-import os
-import sys
+import base64
+import errno
 import logging
+import os
+import select
 import signal
 import socket
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.request
-import base64
+import sys
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-# Configuration
-PROXY_HOST = os.getenv('HTTP_PROXY_HOST', '0.0.0.0')
-PROXY_PORT = int(os.getenv('HTTP_PROXY_PORT', '8080'))
-PROXY_USER = os.getenv('HTTP_PROXY_USER', 'user')
-PROXY_PASS = os.getenv('HTTP_PROXY_PASS', 'pass')
-MAX_CONNECTIONS = int(os.getenv('HTTP_MAX_CONN', '50'))
 
-# Setup logging
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle requests in separate threads"""
+PID_FILE = "/tmp/http_proxy.pid"
+
+
+def get_env_int(name, default, min_value, max_value):
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is invalid, using default %d", name, raw, default)
+        return default
+    if value < min_value or value > max_value:
+        logger.warning(
+            "%s=%d out of range [%d, %d], using default %d",
+            name,
+            value,
+            min_value,
+            max_value,
+            default,
+        )
+        return default
+    return value
+
+
+PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "0.0.0.0")
+PROXY_PORT = get_env_int("HTTP_PROXY_PORT", 8080, 1, 65535)
+PROXY_USER = os.getenv("HTTP_PROXY_USER", "")
+PROXY_PASS = os.getenv("HTTP_PROXY_PASS", "")
+MAX_CONNECTIONS = get_env_int("HTTP_MAX_CONN", 200, 1, 10000)
+REQUEST_TIMEOUT = get_env_int("HTTP_PROXY_TIMEOUT", 30, 5, 300)
+IDLE_TIMEOUT = get_env_int("HTTP_PROXY_IDLE_TIMEOUT", 300, 5, 86400)
+AUTH_FAILURE_LIMIT = get_env_int("HTTP_AUTH_FAIL_LIMIT", 8, 1, 100)
+AUTH_FAILURE_WINDOW = get_env_int("HTTP_AUTH_FAIL_WINDOW", 60, 1, 3600)
+
+
+class ConnectionLimiter:
+    def __init__(self, limit):
+        self.limit = limit
+        self.semaphore = threading.Semaphore(limit)
+
+
+LIMITER = ConnectionLimiter(MAX_CONNECTIONS)
+AUTH_FAILURES = defaultdict(list)
+AUTH_LOCK = threading.Lock()
+
+
+class ProxyHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-class ProxyHandler(BaseHTTPRequestHandler):
-    """HTTP Proxy Handler with authentication"""
-    
-    def log_message(self, format, *args):
-        """Override to use logger instead of stderr"""
-        logger.info("%s - - %s" % (self.address_string(), format % args))
-    
-    def check_auth(self):
-        """Check HTTP Basic Authentication"""
-        auth_header = self.headers.get('Proxy-Authorization')
-        if not auth_header:
-            self.send_response(407)
-            self.send_header('Proxy-Authenticate', 'Basic realm="Proxy"')
-            self.end_headers()
-            return False
-        
-        try:
-            auth_type, credentials = auth_header.split(' ', 1)
-            if auth_type.lower() != 'basic':
-                return False
-            
-            decoded = base64.b64decode(credentials).decode('utf-8')
-            username, password = decoded.split(':', 1)
-            
-            if username == PROXY_USER and password == PROXY_PASS:
-                return True
-            else:
-                logger.warning(f"Failed auth attempt from {self.client_address[0]}")
-                return False
-        except Exception as e:
-            logger.error(f"Auth error: {e}")
-            return False
-    
-    def do_GET(self):
-        """Handle GET requests"""
-        if not self.check_auth():
-            return
-        
-        try:
-            # Forward the request
-            req = urllib.request.Request(self.path)
-            
-            # Copy headers
-            for header, value in self.headers.items():
-                if header.lower() not in ['proxy-authorization', 'proxy-connection']:
-                    req.add_header(header, value)
-            
-            # Get response
-            response = urllib.request.urlopen(req, timeout=30)
-            
-            # Send response
-            self.send_response(response.getcode())
-            for header, value in response.headers.items():
-                self.send_header(header, value)
-            self.end_headers()
-            
-            # Send body
-            self.wfile.write(response.read())
-            
-        except Exception as e:
-            logger.error(f"Error handling GET: {e}")
-            self.send_error(502, f"Bad Gateway: {str(e)}")
-    
-    def do_POST(self):
-        """Handle POST requests"""
-        if not self.check_auth():
-            return
-        
-        try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length)
-            
-            req = urllib.request.Request(self.path, data=post_data)
-            
-            for header, value in self.headers.items():
-                if header.lower() not in ['proxy-authorization', 'proxy-connection']:
-                    req.add_header(header, value)
-            
-            response = urllib.request.urlopen(req, timeout=30)
-            
-            self.send_response(response.getcode())
-            for header, value in response.headers.items():
-                self.send_header(header, value)
-            self.end_headers()
-            
-            self.wfile.write(response.read())
-            
-        except Exception as e:
-            logger.error(f"Error handling POST: {e}")
-            self.send_error(502, f"Bad Gateway: {str(e)}")
-    
-    def do_CONNECT(self):
-        """Handle CONNECT for HTTPS tunneling"""
-        if not self.check_auth():
-            return
-        
-        try:
-            # Parse target
-            host, port = self.path.split(':')
-            port = int(port)
-            
-            # Connect to target
-            target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            target.settimeout(30)
-            target.connect((host, port))
-            
-            # Send success response
-            self.send_response(200, 'Connection Established')
-            self.end_headers()
-            
-            # Start tunneling
-            self.tunnel(self.connection, target)
-            
-        except Exception as e:
-            logger.error(f"Error handling CONNECT: {e}")
-            self.send_error(502, f"Bad Gateway: {str(e)}")
-    
-    def tunnel(self, client, target):
-        """Bidirectional tunnel for HTTPS"""
-        def forward(source, destination):
-            try:
-                while True:
-                    data = source.recv(8192)
-                    if not data:
-                        break
-                    destination.sendall(data)
-            except Exception:
-                pass
-            finally:
-                try:
-                    source.shutdown(socket.SHUT_RDWR)
-                    source.close()
-                except Exception:
-                    pass
-                try:
-                    destination.shutdown(socket.SHUT_RDWR)
-                    destination.close()
-                except Exception:
-                    pass
-        
-        # Start forwarding threads
-        client_to_target = threading.Thread(target=forward, args=(client, target))
-        target_to_client = threading.Thread(target=forward, args=(target, client))
-        
-        client_to_target.daemon = True
-        target_to_client.daemon = True
-        
-        client_to_target.start()
-        target_to_client.start()
-        
-        client_to_target.join()
-        target_to_client.join()
 
-def signal_handler(signum, frame):
-    """Handle shutdown signals"""
-    logger.info(f"Received signal {signum}, shutting down...")
-    sys.exit(0)
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        logger.info("%s - %s", self.client_address[0], fmt % args)
+
+    def setup(self):
+        self.connection.settimeout(IDLE_TIMEOUT)
+        super().setup()
+
+    def handle(self):
+        if not LIMITER.semaphore.acquire(blocking=False):
+            self.close_connection = True
+            return
+        try:
+            super().handle()
+        finally:
+            LIMITER.semaphore.release()
+
+    def _is_rate_limited(self, ip):
+        now = time.time()
+        with AUTH_LOCK:
+            windowed = [ts for ts in AUTH_FAILURES[ip] if now - ts <= AUTH_FAILURE_WINDOW]
+            AUTH_FAILURES[ip] = windowed
+            return len(windowed) >= AUTH_FAILURE_LIMIT
+
+    def _record_auth_failure(self, ip):
+        with AUTH_LOCK:
+            AUTH_FAILURES[ip].append(time.time())
+
+    def _require_auth(self):
+        self.send_response(407, "Proxy Authentication Required")
+        self.send_header("Proxy-Authenticate", 'Basic realm="Proxy"')
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _check_auth(self):
+        client_ip = self.client_address[0]
+        if self._is_rate_limited(client_ip):
+            self.send_error(429, "Too Many Authentication Failures")
+            return False
+
+        auth_header = self.headers.get("Proxy-Authorization", "")
+        if not auth_header:
+            self._require_auth()
+            return False
+
+        try:
+            scheme, encoded = auth_header.split(" ", 1)
+            if scheme.lower() != "basic":
+                self._require_auth()
+                return False
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            username, password = decoded.split(":", 1)
+        except Exception:
+            self._record_auth_failure(client_ip)
+            self._require_auth()
+            return False
+
+        if username != PROXY_USER or password != PROXY_PASS:
+            self._record_auth_failure(client_ip)
+            self._require_auth()
+            return False
+        return True
+
+    def _build_upstream_request(self, method):
+        target_url = self.path
+        parsed = urllib.parse.urlsplit(target_url)
+        if not parsed.scheme or not parsed.netloc:
+            host = self.headers.get("Host", "")
+            if not host:
+                raise ValueError("Host header is required")
+            target_url = f"http://{host}{self.path}"
+
+        body = None
+        if method in ("POST", "PUT", "PATCH"):
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length) if content_length > 0 else None
+
+        req = urllib.request.Request(target_url, data=body, method=method)
+        skip_headers = {
+            "proxy-authorization",
+            "proxy-connection",
+            "connection",
+            "keep-alive",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+        }
+        for key, value in self.headers.items():
+            if key.lower() not in skip_headers:
+                req.add_header(key, value)
+
+        req.add_header("Connection", "close")
+        return req
+
+    def _proxy_http(self, method):
+        if not self._check_auth():
+            return
+        try:
+            req = self._build_upstream_request(method)
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
+                payload = response.read()
+                self.send_response(response.status)
+
+                skip_headers = {
+                    "connection",
+                    "proxy-connection",
+                    "transfer-encoding",
+                    "keep-alive",
+                    "upgrade",
+                }
+                for key, value in response.headers.items():
+                    if key.lower() not in skip_headers:
+                        self.send_header(key, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if method != "HEAD":
+                    self.wfile.write(payload)
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            self.send_response(exc.code)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if method != "HEAD":
+                self.wfile.write(payload)
+        except Exception as exc:
+            logger.error("%s %s failed: %s", method, self.path, exc)
+            self.send_error(502, f"Bad Gateway: {exc}")
+
+    def _relay_bidirectional(self, client, upstream):
+        sockets = [client, upstream]
+        while True:
+            readable, _, exceptional = select.select(sockets, [], sockets, IDLE_TIMEOUT)
+            if exceptional or not readable:
+                break
+            for source in readable:
+                destination = upstream if source is client else client
+                data = source.recv(32768)
+                if not data:
+                    return
+                destination.sendall(data)
+
+    def do_CONNECT(self):
+        if not self._check_auth():
+            return
+
+        upstream = None
+        try:
+            target = self.path.strip()
+            if target.startswith("[") and "]:" in target:
+                host, port_text = target[1:].rsplit("]:", 1)
+            else:
+                host, port_text = target.rsplit(":", 1)
+            port = int(port_text)
+            upstream = socket.create_connection((host, port), timeout=REQUEST_TIMEOUT)
+            upstream.settimeout(IDLE_TIMEOUT)
+
+            self.send_response(200, "Connection Established")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            self.connection.settimeout(IDLE_TIMEOUT)
+            self._relay_bidirectional(self.connection, upstream)
+        except Exception as exc:
+            logger.error("CONNECT %s failed: %s", self.path, exc)
+            self.send_error(502, f"Bad Gateway: {exc}")
+        finally:
+            if upstream:
+                try:
+                    upstream.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+    def do_GET(self):
+        self._proxy_http("GET")
+
+    def do_POST(self):
+        self._proxy_http("POST")
+
+    def do_PUT(self):
+        self._proxy_http("PUT")
+
+    def do_DELETE(self):
+        self._proxy_http("DELETE")
+
+    def do_PATCH(self):
+        self._proxy_http("PATCH")
+
+    def do_HEAD(self):
+        self._proxy_http("HEAD")
+
+    def do_OPTIONS(self):
+        self._proxy_http("OPTIONS")
+
+
+class ProxyApp:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.server = None
+        self.running = True
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        logger.info("Received signal %s, shutting down", signum)
+        self.running = False
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+
+    def _cleanup_stale_pid_file(self):
+        if not os.path.exists(PID_FILE):
+            return
+        try:
+            with open(PID_FILE, "r", encoding="utf-8") as handle:
+                pid = int(handle.read().strip())
+            if pid != os.getpid():
+                try:
+                    os.kill(pid, 0)
+                    logger.warning("Another http proxy process (pid %d) appears active", pid)
+                except OSError:
+                    os.remove(PID_FILE)
+        except Exception:
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
+
+    def _write_pid_file(self):
+        with open(PID_FILE, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+
+    def _remove_pid_file(self):
+        try:
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+        except OSError:
+            pass
+
+    def _bind_with_retries(self, attempts=30, delay=2):
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return ProxyHTTPServer((self.host, self.port), ProxyHandler)
+            except OSError as exc:
+                last_error = exc
+                if exc.errno in (errno.EADDRINUSE, 98, 10048):
+                    logger.warning(
+                        "Port %s busy (%d/%d), retrying in %ss",
+                        self.port,
+                        attempt,
+                        attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        raise RuntimeError(f"Cannot bind {self.host}:{self.port}: {last_error}")
+
+    def run(self):
+        self._cleanup_stale_pid_file()
+        self._write_pid_file()
+        logger.info("HTTP proxy starting on %s:%s", self.host, self.port)
+        logger.info("Max connections: %d", MAX_CONNECTIONS)
+
+        while self.running:
+            try:
+                self.server = self._bind_with_retries()
+                logger.info("HTTP proxy listening on %s:%s", self.host, self.port)
+                self.server.serve_forever(poll_interval=1)
+            except Exception as exc:
+                if not self.running:
+                    break
+                logger.error("HTTP server loop error: %s", exc)
+                time.sleep(2)
+            finally:
+                if self.server:
+                    try:
+                        self.server.server_close()
+                    except OSError:
+                        pass
+                    self.server = None
+        self._remove_pid_file()
+
 
 def main():
-    # Setup signal handlers
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    logger.info("=" * 50)
-    logger.info("HTTP/HTTPS Proxy Server")
-    logger.info("=" * 50)
-    logger.info(f"Starting on {PROXY_HOST}:{PROXY_PORT}")
-    logger.info(f"Username: {PROXY_USER}")
-    logger.info(f"Max connections: {MAX_CONNECTIONS}")
-    logger.info("=" * 50)
-    
-    try:
-        server = ThreadedHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
-        logger.info(f"✓ HTTP Proxy started successfully on {PROXY_HOST}:{PROXY_PORT}")
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+    if not PROXY_USER or not PROXY_PASS:
+        logger.error("HTTP_PROXY_USER and HTTP_PROXY_PASS must be set via environment")
         sys.exit(1)
 
-if __name__ == '__main__':
+    app = ProxyApp(PROXY_HOST, PROXY_PORT)
+    app.run()
+
+
+if __name__ == "__main__":
     main()

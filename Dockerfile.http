@@ -29,8 +29,8 @@ RUN useradd -r -u 1000 -s /bin/false appuser && \
 # Environment variables
 ENV HTTP_PROXY_HOST=0.0.0.0 \
     HTTP_PROXY_PORT=8080 \
-    HTTP_PROXY_USER=user \
-    HTTP_PROXY_PASS=pass \
+    HTTP_PROXY_USER= \
+    HTTP_PROXY_PASS= \
     HTTP_MAX_CONN=50 \
     PYTHONUNBUFFERED=1
 
@@ -39,7 +39,7 @@ EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', int('${HTTP_PROXY_PORT}'))); s.close()" || exit 1
+    CMD python3 -c "import os,socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', int(os.getenv('HTTP_PROXY_PORT','8080')))); s.close()"
 
 # Run as non-root
 USER appuser
