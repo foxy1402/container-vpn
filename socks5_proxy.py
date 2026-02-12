@@ -18,7 +18,7 @@ from threading import Lock, Semaphore
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("SOCKS5_LOG_LEVEL", "INFO").upper(), logging.INFO),
 )
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,8 @@ CONNECTION_TIMEOUT = get_env_int("SOCKS5_TIMEOUT", 15, 3, 300)
 IDLE_TIMEOUT = get_env_int("SOCKS5_IDLE_TIMEOUT", 300, 5, 86400)
 AUTH_FAILURE_LIMIT = get_env_int("SOCKS5_AUTH_FAIL_LIMIT", 5, 1, 100)
 AUTH_FAILURE_WINDOW = get_env_int("SOCKS5_AUTH_FAIL_WINDOW", 60, 1, 3600)
+ALLOW_NOAUTH = os.getenv("SOCKS5_ALLOW_NOAUTH", "false").strip().lower() in ("1", "true", "yes", "on")
+FORCE_IPV4 = os.getenv("SOCKS5_FORCE_IPV4", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 class SOCKS5Server:
@@ -154,6 +156,26 @@ class SOCKS5Server:
     def _reply(self, sock, rep):
         sock.sendall(struct.pack("!BBBBIH", 5, rep, 0, 1, 0, 0))
 
+    def _connect_target(self, dst, dst_port):
+        if FORCE_IPV4:
+            addrinfo = socket.getaddrinfo(dst, dst_port, socket.AF_INET, socket.SOCK_STREAM)
+            last_exc = None
+            for family, socktype, proto, _, sockaddr in addrinfo:
+                remote = None
+                try:
+                    remote = socket.socket(family, socktype, proto)
+                    remote.settimeout(CONNECTION_TIMEOUT)
+                    remote.connect(sockaddr)
+                    return remote
+                except OSError as exc:
+                    last_exc = exc
+                    if remote:
+                        remote.close()
+            if last_exc:
+                raise last_exc
+            raise OSError("No IPv4 address found for destination")
+        return socket.create_connection((dst, dst_port), timeout=CONNECTION_TIMEOUT)
+
     def _relay(self, client, remote):
         sockets = [client, remote]
         try:
@@ -189,49 +211,64 @@ class SOCKS5Server:
             methods = self._recv_exact(client_socket, nmethods)
             if not methods:
                 return
+            selected_auth_method = None
             if 2 in methods:
+                selected_auth_method = 2
                 client_socket.sendall(struct.pack("!BB", 5, 2))
+            elif ALLOW_NOAUTH and 0 in methods:
+                selected_auth_method = 0
+                client_socket.sendall(struct.pack("!BB", 5, 0))
             else:
+                logger.warning(
+                    "No compatible auth method from %s. Client methods=%s allow_noauth=%s",
+                    client_ip,
+                    list(methods),
+                    ALLOW_NOAUTH,
+                )
                 client_socket.sendall(struct.pack("!BB", 5, 255))
                 return
 
-            if not self._check_rate_limit(client_ip):
-                client_socket.sendall(struct.pack("!BB", 1, 1))
-                return
+            if selected_auth_method == 2:
+                if not self._check_rate_limit(client_ip):
+                    client_socket.sendall(struct.pack("!BB", 1, 1))
+                    return
 
-            auth_header = self._recv_exact(client_socket, 2)
-            if not auth_header:
-                return
-            auth_version, user_len = struct.unpack("!BB", auth_header)
-            if auth_version != 1:
-                client_socket.sendall(struct.pack("!BB", 1, 1))
-                return
+                auth_header = self._recv_exact(client_socket, 2)
+                if not auth_header:
+                    return
+                auth_version, user_len = struct.unpack("!BB", auth_header)
+                if auth_version != 1:
+                    client_socket.sendall(struct.pack("!BB", 1, 1))
+                    return
 
-            user_raw = self._recv_exact(client_socket, user_len)
-            if user_raw is None:
-                return
-            pass_len_raw = self._recv_exact(client_socket, 1)
-            if pass_len_raw is None:
-                return
-            pass_len = pass_len_raw[0]
-            pass_raw = self._recv_exact(client_socket, pass_len)
-            if pass_raw is None:
-                return
+                user_raw = self._recv_exact(client_socket, user_len)
+                if user_raw is None:
+                    return
+                pass_len_raw = self._recv_exact(client_socket, 1)
+                if pass_len_raw is None:
+                    return
+                pass_len = pass_len_raw[0]
+                pass_raw = self._recv_exact(client_socket, pass_len)
+                if pass_raw is None:
+                    return
 
-            username = user_raw.decode("utf-8", errors="ignore")
-            password = pass_raw.decode("utf-8", errors="ignore")
-            if username != self.username or password != self.password:
-                self._record_auth_failure(client_ip)
-                client_socket.sendall(struct.pack("!BB", 1, 1))
-                logger.warning("Auth failed from %s", client_ip)
-                return
-            client_socket.sendall(struct.pack("!BB", 1, 0))
+                username = user_raw.decode("utf-8", errors="ignore")
+                password = pass_raw.decode("utf-8", errors="ignore")
+                if username != self.username or password != self.password:
+                    self._record_auth_failure(client_ip)
+                    client_socket.sendall(struct.pack("!BB", 1, 1))
+                    logger.warning("Auth failed from %s", client_ip)
+                    return
+                client_socket.sendall(struct.pack("!BB", 1, 0))
+            else:
+                logger.info("Accepted no-auth SOCKS5 client from %s", client_ip)
 
             req_header = self._recv_exact(client_socket, 4)
             if not req_header:
                 return
             _, cmd, _, atyp = struct.unpack("!BBBB", req_header)
             if cmd != 1:
+                logger.warning("Unsupported SOCKS5 cmd=%s from %s", cmd, client_ip)
                 self._reply(client_socket, 7)
                 return
 
@@ -249,8 +286,10 @@ class SOCKS5Server:
                     return
                 dst = domain.decode("utf-8", errors="ignore")
             elif atyp == 4:
-                self._reply(client_socket, 8)
-                return
+                addr_raw = self._recv_exact(client_socket, 16)
+                if not addr_raw:
+                    return
+                dst = socket.inet_ntop(socket.AF_INET6, addr_raw)
             else:
                 self._reply(client_socket, 8)
                 return
@@ -260,14 +299,37 @@ class SOCKS5Server:
                 return
             dst_port = struct.unpack("!H", port_raw)[0]
 
-            remote = socket.create_connection((dst, dst_port), timeout=CONNECTION_TIMEOUT)
-            remote.settimeout(IDLE_TIMEOUT)
+            try:
+                remote = self._connect_target(dst, dst_port)
+                remote.settimeout(IDLE_TIMEOUT)
+            except socket.gaierror as exc:
+                logger.warning("DNS resolution failed from %s to %s:%s: %s", client_ip, dst, dst_port, exc)
+                self._reply(client_socket, 4)
+                return
+            except OSError as exc:
+                if exc.errno == 101:
+                    logger.warning(
+                        "Network unreachable from %s to %s:%s (likely IPv6/no route): %s",
+                        client_ip,
+                        dst,
+                        dst_port,
+                        exc,
+                    )
+                    self._reply(client_socket, 3)
+                    return
+                logger.warning("Connection failed from %s to %s:%s: %s", client_ip, dst, dst_port, exc)
+                self._reply(client_socket, 5)
+                return
+
             bind_host, bind_port = remote.getsockname()[:2]
             if ":" in bind_host:
-                bind_host = "0.0.0.0"
-            client_socket.sendall(
-                struct.pack("!BBBBIH", 5, 0, 0, 1, struct.unpack("!I", socket.inet_aton(bind_host))[0], bind_port)
-            )
+                reply = struct.pack("!BBBB", 5, 0, 0, 4) + socket.inet_pton(socket.AF_INET6, bind_host) + struct.pack(
+                    "!H", bind_port
+                )
+            else:
+                reply = struct.pack("!BBBB", 5, 0, 0, 1) + socket.inet_aton(bind_host) + struct.pack("!H", bind_port)
+            client_socket.sendall(reply)
+            logger.info("%s connected to %s:%s", client_ip, dst, dst_port)
             client_socket.settimeout(IDLE_TIMEOUT)
             self._relay(client_socket, remote)
         except (socket.timeout, ConnectionResetError, BrokenPipeError):

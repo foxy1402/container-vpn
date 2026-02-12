@@ -59,6 +59,7 @@ REQUEST_TIMEOUT = get_env_int("HTTP_PROXY_TIMEOUT", 30, 5, 300)
 IDLE_TIMEOUT = get_env_int("HTTP_PROXY_IDLE_TIMEOUT", 300, 5, 86400)
 AUTH_FAILURE_LIMIT = get_env_int("HTTP_AUTH_FAIL_LIMIT", 5, 1, 100)
 AUTH_FAILURE_WINDOW = get_env_int("HTTP_AUTH_FAIL_WINDOW", 60, 1, 3600)
+FORCE_IPV4 = os.getenv("HTTP_PROXY_FORCE_IPV4", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 class ConnectionLimiter:
@@ -278,6 +279,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.debug("Relay error: %s", exc)
 
+    def _connect_upstream(self, host, port):
+        if FORCE_IPV4:
+            addrinfo = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            last_exc = None
+            for family, socktype, proto, _, sockaddr in addrinfo:
+                upstream = None
+                try:
+                    upstream = socket.socket(family, socktype, proto)
+                    upstream.settimeout(REQUEST_TIMEOUT)
+                    upstream.connect(sockaddr)
+                    return upstream
+                except OSError as exc:
+                    last_exc = exc
+                    if upstream:
+                        upstream.close()
+            if last_exc:
+                raise last_exc
+            raise OSError("No IPv4 address found for destination")
+        return socket.create_connection((host, port), timeout=REQUEST_TIMEOUT)
+
     def do_CONNECT(self):
         if not self._check_auth():
             return
@@ -303,7 +324,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(403, "Target not allowed")
                 return
 
-            upstream = socket.create_connection((host, port), timeout=REQUEST_TIMEOUT)
+            upstream = self._connect_upstream(host, port)
             upstream.settimeout(IDLE_TIMEOUT)
 
             self.send_response(200, "Connection Established")
@@ -312,6 +333,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             self.connection.settimeout(IDLE_TIMEOUT)
             self._relay_bidirectional(self.connection, upstream)
+        except socket.gaierror as exc:
+            logger.error("CONNECT %s failed: DNS resolution error: %s", self.path, exc)
+            self.send_error(502, f"Bad Gateway: DNS resolution failed ({exc})")
+        except OSError as exc:
+            if exc.errno == 101:
+                logger.error("CONNECT %s failed: network unreachable (likely IPv6/no route): %s", self.path, exc)
+                self.send_error(502, f"Bad Gateway: network unreachable ({exc})")
+            else:
+                logger.error("CONNECT %s failed: %s", self.path, exc)
+                self.send_error(502, f"Bad Gateway: {exc}")
         except Exception as exc:
             logger.error("CONNECT %s failed: %s", self.path, exc)
             self.send_error(502, f"Bad Gateway: {exc}")

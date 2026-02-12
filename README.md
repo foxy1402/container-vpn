@@ -45,6 +45,15 @@ Required env:
 - `SOCKS5_USER`
 - `SOCKS5_PASS`
 
+Recommended env block (copy/paste):
+
+```yaml
+SOCKS5_USER: "your-username"
+SOCKS5_PASS: "your-strong-password"
+SOCKS5_FORCE_IPV4: "true"
+SOCKS5_LOG_LEVEL: "INFO"
+```
+
 Optional env:
 
 - `SOCKS5_HOST` (default `0.0.0.0`)
@@ -52,8 +61,11 @@ Optional env:
 - `SOCKS5_MAX_CONN` (default `200`)
 - `SOCKS5_TIMEOUT` (default `15`)
 - `SOCKS5_IDLE_TIMEOUT` (default `300`)
-- `SOCKS5_AUTH_FAIL_LIMIT` (default `8`)
+- `SOCKS5_AUTH_FAIL_LIMIT` (default `5`)
 - `SOCKS5_AUTH_FAIL_WINDOW` (default `60`)
+- `SOCKS5_FORCE_IPV4` (default `true`, recommended for IPv4-only cloud egress)
+- `SOCKS5_ALLOW_NOAUTH` (default `false`, only enable if your client app cannot use user/pass)
+- `SOCKS5_LOG_LEVEL` (default `INFO`, use `DEBUG` for troubleshooting)
 
 Run:
 
@@ -79,6 +91,14 @@ Required env:
 - `HTTP_PROXY_USER`
 - `HTTP_PROXY_PASS`
 
+Recommended env block (copy/paste):
+
+```yaml
+HTTP_PROXY_USER: "your-username"
+HTTP_PROXY_PASS: "your-strong-password"
+HTTP_PROXY_FORCE_IPV4: "true"
+```
+
 Optional env:
 
 - `HTTP_PROXY_HOST` (default `0.0.0.0`)
@@ -86,8 +106,9 @@ Optional env:
 - `HTTP_MAX_CONN` (default `200`)
 - `HTTP_PROXY_TIMEOUT` (default `30`)
 - `HTTP_PROXY_IDLE_TIMEOUT` (default `300`)
-- `HTTP_AUTH_FAIL_LIMIT` (default `8`)
+- `HTTP_AUTH_FAIL_LIMIT` (default `5`)
 - `HTTP_AUTH_FAIL_WINDOW` (default `60`)
+- `HTTP_PROXY_FORCE_IPV4` (default `true`, recommended for IPv4-only cloud egress)
 
 Run:
 
@@ -132,6 +153,14 @@ Mount `/etc/wireguard` so server keys and generated clients survive container re
 - `WG_CLIENT_ALLOWED_IPS` (default `0.0.0.0/0,::/0`)
 - `WG_PERSISTENT_KEEPALIVE` (default `25`)
 - `WG_HEALTH_INTERVAL` (default `15`)
+
+Recommended env block (copy/paste):
+
+```yaml
+WG_ENDPOINT: "your.public.domain.or.ip:51820"
+WG_CLIENT_COUNT: "3"
+WG_DNS: "1.1.1.1"
+```
 
 Run:
 
