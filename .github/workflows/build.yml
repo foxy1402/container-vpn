@@ -1,0 +1,103 @@
+name: Build and Push Multi-Service Proxy Images
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - name: socks5
+            dockerfile: Dockerfile
+            context: .
+          - name: http-proxy
+            dockerfile: Dockerfile.http
+            context: .
+          - name: wireguard
+            dockerfile: Dockerfile.wireguard
+            context: .
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch,suffix=-${{ matrix.service.name }}
+            type=ref,event=pr,suffix=-${{ matrix.service.name }}
+            type=semver,pattern={{version}},suffix=-${{ matrix.service.name }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.service.name }}
+            type=raw,value=${{ matrix.service.name }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Test image
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Testing ${{ matrix.service.name }} image..."
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }}
+          case "${{ matrix.service.name }}" in
+            socks5)
+              cid=$(docker run -d \
+                -e SOCKS5_USER=testuser \
+                -e SOCKS5_PASS=testpass \
+                -p 127.0.0.1:11080:1080 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
+              sleep 3
+              docker exec "$cid" python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1',1080)); s.close()"
+              docker rm -f "$cid"
+              ;;
+            http-proxy)
+              cid=$(docker run -d \
+                -e HTTP_PROXY_USER=testuser \
+                -e HTTP_PROXY_PASS=testpass \
+                -p 127.0.0.1:18080:8080 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
+              sleep 3
+              docker exec "$cid" python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1',8080)); s.close()"
+              docker rm -f "$cid"
+              ;;
+            wireguard)
+              docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }} >/dev/null
+              ;;
+          esac
