@@ -85,8 +85,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         logger.info("%s - %s", self.client_address[0], fmt % args)
 
     def setup(self):
-        self.connection.settimeout(IDLE_TIMEOUT)
         super().setup()
+        self.connection.settimeout(IDLE_TIMEOUT)
 
     def handle(self):
         global ACTIVE_CONNECTIONS
