@@ -1,0 +1,48 @@
+FROM debian:13-slim
+
+# Metadata
+LABEL org.opencontainers.image.title="HTTP Proxy"
+LABEL org.opencontainers.image.description="Production-ready HTTP/HTTPS proxy with authentication"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.authors="CloudProxy"
+LABEL service.type="http-proxy"
+
+# Install Python
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 \
+        ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy application
+COPY http_proxy.py /app/http_proxy.py
+RUN chmod +x /app/http_proxy.py
+
+# Create non-root user
+RUN useradd -r -u 1000 -s /bin/false appuser && \
+    chown -R appuser:appuser /app
+
+# Environment variables
+ENV HTTP_PROXY_HOST=0.0.0.0 \
+    HTTP_PROXY_PORT=8080 \
+    HTTP_PROXY_USER=user \
+    HTTP_PROXY_PASS=pass \
+    HTTP_MAX_CONN=50 \
+    PYTHONUNBUFFERED=1
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', int('${HTTP_PROXY_PORT}'))); s.close()" || exit 1
+
+# Run as non-root
+USER appuser
+
+# Start application
+CMD ["python3", "-u", "/app/http_proxy.py"]

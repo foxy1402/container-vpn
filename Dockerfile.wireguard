@@ -1,0 +1,47 @@
+FROM debian:13-slim
+
+# Metadata
+LABEL org.opencontainers.image.title="WireGuard VPN"
+LABEL org.opencontainers.image.description="WireGuard VPN client for secure tunneling"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.authors="CloudProxy"
+LABEL service.type="wireguard"
+
+# Install WireGuard and dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        wireguard-tools \
+        iproute2 \
+        iptables \
+        openresolv \
+        procps && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Copy startup script
+COPY wireguard-start.sh /usr/local/bin/wireguard-start.sh
+RUN chmod +x /usr/local/bin/wireguard-start.sh
+
+# Create WireGuard directory
+RUN mkdir -p /etc/wireguard && chmod 700 /etc/wireguard
+
+# Environment variables (examples - must be overridden)
+ENV WG_PRIVATE_KEY="" \
+    WG_PEER_PUBLIC_KEY="" \
+    WG_ADDRESS="10.0.0.2/24" \
+    WG_ENDPOINT="" \
+    WG_DNS="1.1.1.1" \
+    WG_ALLOWED_IPS="0.0.0.0/0" \
+    WG_KEEPALIVE="25"
+
+# WireGuard needs to run as root for network config
+# But we create a dedicated user for potential future use
+RUN useradd -r -u 1000 -s /bin/false wguser
+
+# Health check - verify tunnel is up
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD wg show wg0 || exit 1
+
+# Note: WireGuard requires NET_ADMIN capability
+# Deploy with: --cap-add=NET_ADMIN --device=/dev/net/tun
+ENTRYPOINT ["/usr/local/bin/wireguard-start.sh"]

@@ -1,0 +1,85 @@
+version: '3.8'
+
+# Local testing with docker-compose
+# Each service runs independently
+
+services:
+  # SOCKS5 Proxy Service
+  socks5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: proxy:socks5
+    container_name: proxy-socks5
+    ports:
+      - "1080:1080"
+    environment:
+      - SOCKS5_HOST=0.0.0.0
+      - SOCKS5_PORT=1080
+      - SOCKS5_USER=testuser
+      - SOCKS5_PASS=testpass
+      - SOCKS5_MAX_CONN=50
+      - SOCKS5_TIMEOUT=30
+      - SOCKS5_IDLE_TIMEOUT=300
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 1080)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - proxy-net
+
+  # HTTP Proxy Service
+  http-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.http
+    image: proxy:http-proxy
+    container_name: proxy-http
+    ports:
+      - "8080:8080"
+    environment:
+      - HTTP_PROXY_HOST=0.0.0.0
+      - HTTP_PROXY_PORT=8080
+      - HTTP_PROXY_USER=testuser
+      - HTTP_PROXY_PASS=testpass
+      - HTTP_MAX_CONN=50
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 8080)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - proxy-net
+
+  # WireGuard VPN Service
+  # Note: Requires privileged mode and /dev/net/tun
+  # Uncomment and configure if you want to test WireGuard locally
+  # wireguard:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.wireguard
+  #   image: proxy:wireguard
+  #   container_name: proxy-wireguard
+  #   cap_add:
+  #     - NET_ADMIN
+  #   devices:
+  #     - /dev/net/tun
+  #   environment:
+  #     - WG_PRIVATE_KEY=your-private-key-here
+  #     - WG_PEER_PUBLIC_KEY=server-public-key-here
+  #     - WG_ENDPOINT=vpn.server.com:51820
+  #     - WG_ADDRESS=10.0.0.2/24
+  #     - WG_DNS=1.1.1.1
+  #     - WG_ALLOWED_IPS=0.0.0.0/0
+  #   restart: unless-stopped
+  #   networks:
+  #     - proxy-net
+
+networks:
+  proxy-net:
+    driver: bridge
