@@ -5,6 +5,7 @@ Cloud-ready container images for three independent services:
 - SOCKS5 proxy (`:socks5`)
 - HTTP/HTTPS proxy (`:http-proxy`)
 - WireGuard VPN server (`:wireguard`)
+- GOST multi-protocol proxy (`:gost`)
 
 Each service is deployed separately (one container per service).
 
@@ -13,6 +14,7 @@ Each service is deployed separately (one container per service).
 - `ghcr.io/foxy1402/container-vpn:socks5`
 - `ghcr.io/foxy1402/container-vpn:http-proxy`
 - `ghcr.io/foxy1402/container-vpn:wireguard`
+- `ghcr.io/foxy1402/container-vpn:gost`
 
 ## Images and ports
 
@@ -21,6 +23,7 @@ Each service is deployed separately (one container per service).
 | `ghcr.io/foxy1402/container-vpn:socks5` | SOCKS5 with username/password auth | `1080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:http-proxy` | HTTP proxy + HTTPS CONNECT tunnel | `8080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:wireguard` | WireGuard server that auto-generates client configs | `51820/udp` |
+| `ghcr.io/foxy1402/container-vpn:gost` | Multi-protocol on one port (SOCKS5 + HTTP CONNECT + optional Shadowsocks) | `8080/tcp` |
 
 ## Build
 
@@ -180,6 +183,61 @@ Generated client configs:
 - `./wireguard-data/clients/client1/client1.conf`
 - `./wireguard-data/clients/client2/client2.conf`
 - ...
+
+## 4) GOST multi-protocol proxy
+
+This image supports SOCKS5 + HTTP CONNECT on one port, and optional Shadowsocks on the same port.
+
+Authentication/credentials are configured via environment variables.
+
+Required env:
+
+- `GOST_USER`
+- `GOST_PASS`
+
+Recommended env block (copy/paste):
+
+```yaml
+GOST_USER: "your-username"
+GOST_PASS: "your-strong-password"
+GOST_FORCE_IPV4: "true"
+```
+
+Optional env:
+
+- `GOST_HOST` (default `0.0.0.0`)
+- `GOST_PORT` (default `8080`)
+- `GOST_SS_KEY` (optional, enables Shadowsocks when set)
+- `GOST_SS_CIPHER` (default `aes-256-gcm`)
+- `GOST_MAX_CONN` (default `200`)
+- `GOST_TIMEOUT` (default `15`)
+- `GOST_IDLE_TIMEOUT` (default `300`)
+- `GOST_AUTH_FAIL_LIMIT` (default `5`)
+- `GOST_AUTH_FAIL_WINDOW` (default `60`)
+- `GOST_ALLOW_NOAUTH` (default `false`)
+- `GOST_FORCE_IPV4` (default `true`)
+
+Run:
+
+```bash
+docker run -d \
+  --name gost-proxy \
+  -p 8080:8080 \
+  -e GOST_USER=myuser \
+  -e GOST_PASS='strong-password' \
+  -e GOST_SS_KEY='optional-shadowsocks-key' \
+  ghcr.io/foxy1402/container-vpn:gost
+```
+
+Test:
+
+```bash
+# SOCKS5
+curl -x socks5h://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
+
+# HTTP CONNECT
+curl -x http://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
+```
 
 ## docker compose
 

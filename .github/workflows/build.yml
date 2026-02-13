@@ -27,6 +27,9 @@ jobs:
           - name: wireguard
             dockerfile: Dockerfile.wireguard
             context: .
+          - name: gost
+            dockerfile: Dockerfile.gost
+            context: .
     
     permissions:
       contents: read
@@ -99,5 +102,16 @@ jobs:
               ;;
             wireguard)
               docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }} >/dev/null
+              ;;
+            gost)
+              cid=$(docker run -d \
+                -e GOST_USER=testuser \
+                -e GOST_PASS=testpass \
+                -e GOST_FORCE_IPV4=true \
+                -p 127.0.0.1:28080:8080 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
+              sleep 3
+              docker exec "$cid" /app/gost-proxy-healthcheck.sh
+              docker rm -f "$cid"
               ;;
           esac

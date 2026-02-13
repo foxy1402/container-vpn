@@ -1,0 +1,84 @@
+FROM golang:1.22-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates
+
+# Set working directory
+WORKDIR /build
+
+# BuildKit provides TARGETOS/TARGETARCH for multi-platform builds
+ARG TARGETOS
+ARG TARGETARCH
+
+# Copy module files first for better layer caching
+COPY go.mod ./
+RUN go mod download
+
+# Copy source
+COPY gost-proxy.go ./
+
+# Build static binary
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -a -installsuffix cgo \
+    -ldflags="-w -s" \
+    -o gost-proxy gost-proxy.go
+
+# Final minimal image
+FROM debian:13-slim
+
+# Metadata
+LABEL org.opencontainers.image.title="GOST Multi-Protocol Proxy"
+LABEL org.opencontainers.image.description="Production-ready SOCKS5/HTTP/Shadowsocks proxy with auto protocol detection"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.authors="CloudProxy"
+LABEL service.type="gost-multi"
+
+# Install minimal runtime dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /build/gost-proxy /app/gost-proxy
+RUN chmod +x /app/gost-proxy
+
+# Create non-root user
+RUN useradd -r -u 1000 -s /bin/false appuser && \
+    chown -R appuser:appuser /app
+
+# Environment variables
+ENV GOST_HOST=0.0.0.0 \
+    GOST_PORT=8080 \
+    GOST_USER= \
+    GOST_PASS= \
+    GOST_SS_KEY= \
+    GOST_SS_CIPHER=aes-256-gcm \
+    GOST_MAX_CONN=200 \
+    GOST_TIMEOUT=15 \
+    GOST_IDLE_TIMEOUT=300 \
+    GOST_AUTH_FAIL_LIMIT=5 \
+    GOST_AUTH_FAIL_WINDOW=60 \
+    GOST_ALLOW_NOAUTH=false \
+    GOST_FORCE_IPV4=true
+
+# Expose port
+EXPOSE 8080
+
+# Copy health check script
+COPY gost-proxy-healthcheck.sh /app/gost-proxy-healthcheck.sh
+RUN chmod +x /app/gost-proxy-healthcheck.sh
+
+# Health check - test SOCKS5 protocol detection
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD /app/gost-proxy-healthcheck.sh || exit 1
+
+# Run as non-root
+USER appuser
+
+# Start application
+CMD ["/app/gost-proxy"]

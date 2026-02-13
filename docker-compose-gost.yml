@@ -1,0 +1,124 @@
+version: '3.8'
+
+# Multi-protocol proxy service configuration
+# Includes SOCKS5, HTTP, WireGuard, and new GOST multi-protocol proxy
+
+services:
+  # SOCKS5 Proxy Service (Port 1080)
+  socks5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: proxy:socks5
+    container_name: proxy-socks5
+    ports:
+      - "1080:1080"
+    environment:
+      - SOCKS5_HOST=0.0.0.0
+      - SOCKS5_PORT=1080
+      - SOCKS5_USER=testuser
+      - SOCKS5_PASS=testpass
+      - SOCKS5_MAX_CONN=50
+      - SOCKS5_TIMEOUT=30
+      - SOCKS5_IDLE_TIMEOUT=300
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 1080)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - proxy-net
+
+  # HTTP Proxy Service (Port 8080 - conflicts with GOST, use 8081)
+  http-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.http
+    image: proxy:http-proxy
+    container_name: proxy-http
+    ports:
+      - "8081:8080"  # Changed from 8080 to avoid conflict with GOST
+    environment:
+      - HTTP_PROXY_HOST=0.0.0.0
+      - HTTP_PROXY_PORT=8080
+      - HTTP_PROXY_USER=testuser
+      - HTTP_PROXY_PASS=testpass
+      - HTTP_MAX_CONN=50
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 8080)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - proxy-net
+
+  # GOST Multi-Protocol Proxy (Port 8080)
+  # Supports SOCKS5 + HTTP CONNECT + Shadowsocks on same port with auto-detection
+  gost-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.gost
+    image: proxy:gost-multi
+    container_name: proxy-gost
+    ports:
+      - "8080:8080"  # Single port for multiple protocols
+    environment:
+      - GOST_HOST=0.0.0.0
+      - GOST_PORT=8080
+      - GOST_USER=testuser
+      - GOST_PASS=testpass
+      - GOST_SS_KEY=your-shadowsocks-password
+      - GOST_SS_CIPHER=aes-256-gcm
+      - GOST_MAX_CONN=200
+      - GOST_TIMEOUT=15
+      - GOST_IDLE_TIMEOUT=300
+      - GOST_AUTH_FAIL_LIMIT=5
+      - GOST_AUTH_FAIL_WINDOW=60
+      - GOST_ALLOW_NOAUTH=false
+      - GOST_FORCE_IPV4=true
+    restart: unless-stopped
+    healthcheck:
+      test: ["/app/gost-proxy-healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - proxy-net
+
+  # WireGuard VPN Server Service
+  # Note: Requires NET_ADMIN and /dev/net/tun
+  # Uncomment to generate server config + client profiles under /etc/wireguard/clients
+  # wireguard:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.wireguard
+  #   image: proxy:wireguard
+  #   container_name: proxy-wireguard
+  #   cap_add:
+  #     - NET_ADMIN
+  #   devices:
+  #     - /dev/net/tun
+  #   environment:
+  #     - WG_INTERFACE=wg0
+  #     - WG_PORT=51820
+  #     - WG_SERVER_CIDR=10.66.66.1/24
+  #     - WG_CLIENT_COUNT=3
+  #     - WG_CLIENT_PREFIX=client
+  #     - WG_ENDPOINT=your.public.ip.or.domain:51820
+  #     - WG_DNS=1.1.1.1
+  #     - WG_CLIENT_ALLOWED_IPS=0.0.0.0/0,::/0
+  #     - WG_PERSISTENT_KEEPALIVE=25
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./wireguard-data:/etc/wireguard
+  #   networks:
+  #     - proxy-net
+
+networks:
+  proxy-net:
+    driver: bridge
