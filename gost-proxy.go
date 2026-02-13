@@ -70,6 +70,7 @@ type Config struct {
 	ShadowsocksKey    string
 	ShadowsocksCipher string
 	MaxConnections    int
+	HandshakeTimeout  time.Duration
 	ConnectionTimeout time.Duration
 	IdleTimeout       time.Duration
 	AuthFailLimit     int
@@ -217,7 +218,7 @@ func (s *Server) handleConnection(rawConn net.Conn) {
 	}()
 
 	// Set read deadline for protocol detection
-	rawConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	rawConn.SetReadDeadline(time.Now().Add(s.config.HandshakeTimeout))
 
 	// Wrap connection for peeking
 	conn := NewConnectionWrapper(rawConn)
@@ -225,6 +226,14 @@ func (s *Server) handleConnection(rawConn net.Conn) {
 	// Detect protocol
 	protocol, err := s.detectProtocol(conn)
 	if err != nil {
+		// Many mobile apps probe by opening and closing quickly; don't treat early EOF as failure.
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			log.Printf("Protocol detection timeout from %s after %s", conn.RemoteAddr(), s.config.HandshakeTimeout)
+			return
+		}
 		log.Printf("Protocol detection failed from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
@@ -1158,6 +1167,7 @@ func main() {
 		ShadowsocksKey:    os.Getenv("GOST_SS_KEY"),
 		ShadowsocksCipher: os.Getenv("GOST_SS_CIPHER"),
 		MaxConnections:    getEnvInt("GOST_MAX_CONN", 200, 1, 10000),
+		HandshakeTimeout:  time.Duration(getEnvInt("GOST_HANDSHAKE_TIMEOUT", 30, 5, 300)) * time.Second,
 		ConnectionTimeout: time.Duration(getEnvInt("GOST_TIMEOUT", 15, 3, 300)) * time.Second,
 		IdleTimeout:       time.Duration(getEnvInt("GOST_IDLE_TIMEOUT", 300, 5, 86400)) * time.Second,
 		AuthFailLimit:     getEnvInt("GOST_AUTH_FAIL_LIMIT", 5, 1, 100),
