@@ -247,21 +247,26 @@ func (s *Server) handleConnection(rawConn net.Conn) {
 
 // detectProtocol determines the protocol from initial bytes
 func (s *Server) detectProtocol(conn *ConnectionWrapper) (string, error) {
-	data, err := conn.Peek(PeekBufferSize)
+	// Peek just one byte first so SOCKS5 clients that send short greetings
+	// are detected immediately without blocking for larger peeks.
+	first, err := conn.Peek(1)
 	if err != nil {
 		return ProtocolUnknown, err
 	}
-
-	// Check for SOCKS5 (starts with 0x05)
-	if len(data) >= 2 && data[0] == SOCKS5Version {
+	if len(first) > 0 && first[0] == SOCKS5Version {
 		return ProtocolSOCKS5, nil
 	}
 
-	// Check for HTTP methods
-	methods := []string{"GET ", "POST", "PUT ", "DELE", "HEAD", "OPTI", "PATC", "CONN"}
-	dataStr := string(data)
+	// Try to peek a small HTTP prefix; tolerate short reads.
+	data, err := conn.Peek(5)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return ProtocolUnknown, err
+	}
+
+	methods := []string{"GET ", "POST ", "PUT ", "DELE", "HEAD ", "OPTI", "PATC", "CONN"}
+	dataStr := strings.ToUpper(string(data))
 	for _, method := range methods {
-		if strings.HasPrefix(dataStr, method) {
+		if strings.HasPrefix(dataStr, method) || strings.HasPrefix(method, dataStr) {
 			return ProtocolHTTP, nil
 		}
 	}

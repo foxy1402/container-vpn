@@ -207,7 +207,7 @@ Optional env:
 
 - `GOST_HOST` (default `0.0.0.0`)
 - `GOST_PORT` (default `8080`)
-- `GOST_SS_KEY` (optional, enables Shadowsocks when set)
+- `GOST_SS_KEY` (optional, enables Shadowsocks when set; this is your Shadowsocks password)
 - `GOST_SS_CIPHER` (default `aes-256-gcm`)
 - `GOST_MAX_CONN` (default `200`)
 - `GOST_TIMEOUT` (default `15`)
@@ -225,7 +225,7 @@ docker run -d \
   -p 8080:8080 \
   -e GOST_USER=myuser \
   -e GOST_PASS='strong-password' \
-  -e GOST_SS_KEY='optional-shadowsocks-key' \
+  -e GOST_SS_KEY='your-shadowsocks-password' \
   ghcr.io/foxy1402/container-vpn:gost
 ```
 
