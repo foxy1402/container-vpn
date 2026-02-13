@@ -248,6 +248,7 @@ func (s *Server) handleConnection(rawConn net.Conn) {
 	case ProtocolHTTP:
 		s.handleHTTP(conn)
 	case ProtocolShadowsocks:
+		// Use wrapped connection so bytes buffered by detectProtocol Peek() are preserved.
 		s.handleShadowsocks(conn)
 	default:
 		log.Printf("Unknown protocol from %s", conn.RemoteAddr())
@@ -807,7 +808,6 @@ func (s *Server) relay(conn1, conn2 net.Conn) {
 	<-done
 }
 
-// getEnvInt gets an integer from environment with validation
 // Shadowsocks AEAD Cipher implementation
 type ShadowsocksCipher struct {
 	key    []byte
@@ -882,8 +882,6 @@ func (sc *ShadowsocksCipher) newAEAD(salt []byte) (cipher.AEAD, error) {
 		}
 		return cipher.NewGCM(block)
 	case "chacha20-ietf-poly1305":
-		// Note: Would need golang.org/x/crypto/chacha20poly1305
-		// For now, only AES-GCM is fully implemented
 		return nil, fmt.Errorf("chacha20-poly1305 not implemented in minimal version")
 	default:
 		return nil, fmt.Errorf("unsupported cipher: %s", sc.cipher)
@@ -920,28 +918,28 @@ func (sc *ShadowsocksCipher) wrapConn(conn net.Conn) (*ShadowsocksConn, error) {
 	// Read salt from client
 	salt := make([]byte, saltSize)
 	if _, err := io.ReadFull(conn, salt); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read client salt: %w", err)
 	}
 
 	readAEAD, err := sc.newAEAD(salt)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create read AEAD: %w", err)
 	}
 
 	// Generate random salt for writing
 	writeSalt := make([]byte, saltSize)
 	if _, err := rand.Read(writeSalt); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate write salt: %w", err)
 	}
 
 	writeAEAD, err := sc.newAEAD(writeSalt)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create write AEAD: %w", err)
 	}
 
 	// Send salt to client
 	if _, err := conn.Write(writeSalt); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to send write salt: %w", err)
 	}
 
 	return &ShadowsocksConn{
@@ -950,6 +948,8 @@ func (sc *ShadowsocksCipher) wrapConn(conn net.Conn) (*ShadowsocksConn, error) {
 		writeAEAD:  writeAEAD,
 		readNonce:  make([]byte, readAEAD.NonceSize()),
 		writeNonce: make([]byte, writeAEAD.NonceSize()),
+		readBuf:    make([]byte, 0, 0x3FFF+readAEAD.Overhead()), // Pre-allocate buffer
+		writeBuf:   make([]byte, 0, 0x3FFF+writeAEAD.Overhead()),
 	}, nil
 }
 
@@ -957,13 +957,13 @@ func (c *ShadowsocksConn) Read(b []byte) (n int, err error) {
 	// Read length (2 bytes encrypted + tag)
 	buf := make([]byte, 2+c.readAEAD.Overhead())
 	if _, err := io.ReadFull(c.Conn, buf); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read length header: %w", err)
 	}
 
 	// Decrypt length
 	lengthBuf, err := c.readAEAD.Open(nil, c.readNonce, buf, nil)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to decrypt length: %w", err)
 	}
 	increment(c.readNonce)
 
@@ -975,13 +975,13 @@ func (c *ShadowsocksConn) Read(b []byte) (n int, err error) {
 	// Read encrypted payload
 	buf = make([]byte, int(payloadLen)+c.readAEAD.Overhead())
 	if _, err := io.ReadFull(c.Conn, buf); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read payload: %w", err)
 	}
 
 	// Decrypt payload
 	payload, err := c.readAEAD.Open(nil, c.readNonce, buf, nil)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to decrypt payload: %w", err)
 	}
 	increment(c.readNonce)
 
@@ -1012,10 +1012,10 @@ func (c *ShadowsocksConn) Write(b []byte) (n int, err error) {
 
 		// Write both
 		if _, err := c.Conn.Write(encLength); err != nil {
-			return n, err
+			return n, fmt.Errorf("failed to write encrypted length: %w", err)
 		}
 		if _, err := c.Conn.Write(encPayload); err != nil {
-			return n, err
+			return n, fmt.Errorf("failed to write encrypted payload: %w", err)
 		}
 
 		n += payloadLen
@@ -1034,8 +1034,8 @@ func increment(nonce []byte) {
 	}
 }
 
-// handleShadowsocks handles Shadowsocks protocol
-func (s *Server) handleShadowsocks(conn *ConnectionWrapper) {
+// handleShadowsocks handles Shadowsocks protocol.
+func (s *Server) handleShadowsocks(conn net.Conn) {
 	clientIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
 	// Create cipher
@@ -1045,9 +1045,7 @@ func (s *Server) handleShadowsocks(conn *ConnectionWrapper) {
 		return
 	}
 
-	// Wrap connection with encryption.
-	// Important: use ConnectionWrapper (not raw conn.Conn) so bytes buffered
-	// during protocol detection Peek() are still readable here.
+	// Wrap connection with encryption
 	ssConn, err := cipher.wrapConn(conn)
 	if err != nil {
 		log.Printf("Failed to wrap Shadowsocks connection from %s: %v", clientIP, err)
@@ -1057,6 +1055,7 @@ func (s *Server) handleShadowsocks(conn *ConnectionWrapper) {
 	// Read target address (SOCKS5-like format)
 	addrBuf := make([]byte, 1)
 	if _, err := ssConn.Read(addrBuf); err != nil {
+		log.Printf("Shadowsocks: Failed to read address type from %s: %v", clientIP, err)
 		return
 	}
 
@@ -1068,6 +1067,7 @@ func (s *Server) handleShadowsocks(conn *ConnectionWrapper) {
 	case 0x01: // IPv4
 		addr := make([]byte, 4)
 		if _, err := io.ReadFull(ssConn, addr); err != nil {
+			log.Printf("Shadowsocks: Failed to read IPv4 from %s: %v", clientIP, err)
 			return
 		}
 		host = net.IP(addr).String()
@@ -1075,10 +1075,12 @@ func (s *Server) handleShadowsocks(conn *ConnectionWrapper) {
 	case 0x03: // Domain
 		lenBuf := make([]byte, 1)
 		if _, err := ssConn.Read(lenBuf); err != nil {
+			log.Printf("Shadowsocks: Failed to read domain length from %s: %v", clientIP, err)
 			return
 		}
 		domain := make([]byte, lenBuf[0])
 		if _, err := io.ReadFull(ssConn, domain); err != nil {
+			log.Printf("Shadowsocks: Failed to read domain from %s: %v", clientIP, err)
 			return
 		}
 		host = string(domain)
@@ -1086,30 +1088,33 @@ func (s *Server) handleShadowsocks(conn *ConnectionWrapper) {
 	case 0x04: // IPv6
 		addr := make([]byte, 16)
 		if _, err := io.ReadFull(ssConn, addr); err != nil {
+			log.Printf("Shadowsocks: Failed to read IPv6 from %s: %v", clientIP, err)
 			return
 		}
 		host = net.IP(addr).String()
 
 	default:
-		log.Printf("Unsupported address type: 0x%02x", atyp)
+		log.Printf("Shadowsocks: Unsupported address type 0x%02x from %s", atyp, clientIP)
 		return
 	}
 
 	// Read port
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(ssConn, portBuf); err != nil {
+		log.Printf("Shadowsocks: Failed to read port from %s: %v", clientIP, err)
 		return
 	}
 	port = binary.BigEndian.Uint16(portBuf)
 
 	// Connect to target
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
-	var remote net.Conn
+
 	if !s.isSafeTarget(host) {
 		log.Printf("Blocked unsafe Shadowsocks target from %s to %s", clientIP, target)
 		return
 	}
 
+	var remote net.Conn
 	if s.config.ForceIPv4 {
 		remote, err = s.dialIPv4(target, s.config.ConnectionTimeout)
 	} else {
