@@ -954,14 +954,21 @@ func (sc *ShadowsocksCipher) wrapConn(conn net.Conn) (*ShadowsocksConn, error) {
 }
 
 func (c *ShadowsocksConn) Read(b []byte) (n int, err error) {
+	// Serve buffered plaintext first if available.
+	if len(c.readBuf) > 0 {
+		n = copy(b, c.readBuf)
+		c.readBuf = c.readBuf[n:]
+		return n, nil
+	}
+
 	// Read length (2 bytes encrypted + tag)
-	buf := make([]byte, 2+c.readAEAD.Overhead())
-	if _, err := io.ReadFull(c.Conn, buf); err != nil {
+	lenCipher := make([]byte, 2+c.readAEAD.Overhead())
+	if _, err := io.ReadFull(c.Conn, lenCipher); err != nil {
 		return 0, fmt.Errorf("failed to read length header: %w", err)
 	}
 
 	// Decrypt length
-	lengthBuf, err := c.readAEAD.Open(nil, c.readNonce, buf, nil)
+	lengthBuf, err := c.readAEAD.Open(nil, c.readNonce, lenCipher, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to decrypt length: %w", err)
 	}
@@ -973,19 +980,22 @@ func (c *ShadowsocksConn) Read(b []byte) (n int, err error) {
 	}
 
 	// Read encrypted payload
-	buf = make([]byte, int(payloadLen)+c.readAEAD.Overhead())
-	if _, err := io.ReadFull(c.Conn, buf); err != nil {
+	payloadCipher := make([]byte, int(payloadLen)+c.readAEAD.Overhead())
+	if _, err := io.ReadFull(c.Conn, payloadCipher); err != nil {
 		return 0, fmt.Errorf("failed to read payload: %w", err)
 	}
 
 	// Decrypt payload
-	payload, err := c.readAEAD.Open(nil, c.readNonce, buf, nil)
+	payload, err := c.readAEAD.Open(nil, c.readNonce, payloadCipher, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to decrypt payload: %w", err)
 	}
 	increment(c.readNonce)
 
-	n = copy(b, payload)
+	// Buffer full plaintext chunk; return as much as caller requested.
+	c.readBuf = append(c.readBuf[:0], payload...)
+	n = copy(b, c.readBuf)
+	c.readBuf = c.readBuf[n:]
 	return n, nil
 }
 
