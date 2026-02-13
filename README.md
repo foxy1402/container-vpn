@@ -248,6 +248,12 @@ Mobile app note:
 - If those check endpoints are blocked/slow in your cloud region, the app can show false timeout/failure even when proxy is working.
 - If your app supports it, disable connectivity check (or change its check URL) when using this proxy.
 
+Shadowsocks Android compatibility note:
+
+- SagerNet works with this setup, but set client routing/domain strategy to prefer IPv4 (or disable IPv6) when server uses `GOST_FORCE_IPV4=true`.
+- `shadowsocks-android` `v5.3.4` is reported working with this server.
+- `shadowsocks-android` `v5.3.5-nightly` is reported not working in this setup.
+
 ## docker compose
 
 Local test for SOCKS5 + HTTP:
