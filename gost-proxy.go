@@ -1045,8 +1045,10 @@ func (s *Server) handleShadowsocks(conn *ConnectionWrapper) {
 		return
 	}
 
-	// Wrap connection with encryption
-	ssConn, err := cipher.wrapConn(conn.Conn)
+	// Wrap connection with encryption.
+	// Important: use ConnectionWrapper (not raw conn.Conn) so bytes buffered
+	// during protocol detection Peek() are still readable here.
+	ssConn, err := cipher.wrapConn(conn)
 	if err != nil {
 		log.Printf("Failed to wrap Shadowsocks connection from %s: %v", clientIP, err)
 		return

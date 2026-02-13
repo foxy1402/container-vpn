@@ -200,6 +200,8 @@ Recommended env block (copy/paste):
 ```yaml
 GOST_USER: "your-username"
 GOST_PASS: "your-strong-password"
+GOST_HANDSHAKE_TIMEOUT: "45"
+GOST_TIMEOUT: "30"
 GOST_FORCE_IPV4: "true"
 ```
 
@@ -210,6 +212,7 @@ Optional env:
 - `GOST_SS_KEY` (optional, enables Shadowsocks when set; this is your Shadowsocks password)
 - `GOST_SS_CIPHER` (default `aes-256-gcm`)
 - `GOST_MAX_CONN` (default `200`)
+- `GOST_HANDSHAKE_TIMEOUT` (default `30`, recommended `45` for mobile app compatibility)
 - `GOST_TIMEOUT` (default `15`)
 - `GOST_IDLE_TIMEOUT` (default `300`)
 - `GOST_AUTH_FAIL_LIMIT` (default `5`)
@@ -238,6 +241,12 @@ curl -x socks5h://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
 # HTTP CONNECT
 curl -x http://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
 ```
+
+Mobile app note:
+
+- Some apps (for example Super Proxy on Android) use external connectivity-check URLs.
+- If those check endpoints are blocked/slow in your cloud region, the app can show false timeout/failure even when proxy is working.
+- If your app supports it, disable connectivity check (or change its check URL) when using this proxy.
 
 ## docker compose
 
