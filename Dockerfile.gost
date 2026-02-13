@@ -11,7 +11,7 @@ ARG TARGETOS
 ARG TARGETARCH
 
 # Copy module files first for better layer caching
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy source
