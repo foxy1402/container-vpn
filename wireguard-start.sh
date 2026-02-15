@@ -40,7 +40,7 @@ ensure_cmd() {
 
 ensure_dependencies() {
     local missing=()
-    for cmd in wg wg-quick ip iptables sysctl curl; do
+    for cmd in wg wg-quick ip iptables sysctl; do
         if ! ensure_cmd "$cmd"; then
             missing+=("$cmd")
         fi
@@ -58,7 +58,7 @@ ensure_dependencies() {
     log "Installing missing dependencies: ${missing[*]}"
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        wireguard-tools iproute2 iptables procps curl
+        wireguard-tools iproute2 iptables procps
     rm -rf /var/lib/apt/lists/*
 }
 
@@ -109,7 +109,7 @@ get_public_endpoint() {
         elif ensure_cmd wget; then
             detected_ip="$(wget -4qO- --timeout=5 "$service" 2>/dev/null || true)"
         else
-            break
+            detected_ip=""
         fi
 
         if [ -n "$detected_ip" ] && [[ "$detected_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -118,7 +118,19 @@ get_public_endpoint() {
         fi
     done
 
-    log "ERROR: Could not detect public IP. Please set WG_ENDPOINT manually"
+    # Fallback for restricted environments: use primary route source IP.
+    detected_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
+    if [ -z "$detected_ip" ]; then
+        detected_ip="$(hostname -i 2>/dev/null | awk '{print $1}')"
+    fi
+
+    if [ -n "$detected_ip" ] && [[ "$detected_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        log "WARNING: WG_ENDPOINT not set; using detected IP ${detected_ip}:${WG_PORT}"
+        echo "${detected_ip}:${WG_PORT}"
+        return
+    fi
+
+    log "ERROR: Could not detect public endpoint. Please set WG_ENDPOINT manually (host-or-ip:${WG_PORT})"
     exit 1
 }
 

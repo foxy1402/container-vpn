@@ -68,7 +68,7 @@ services:
   #   cap_add:
   #     - NET_ADMIN
   #   devices:
-  #     - /dev/net/tun
+  #     - /dev/net/tun:/dev/net/tun
   #   environment:
   #     - WG_INTERFACE=wg0
   #     - WG_PORT=51820
@@ -80,6 +80,7 @@ services:
   #     - WG_CLIENT_ALLOWED_IPS=0.0.0.0/0,::/0
   #     - WG_PERSISTENT_KEEPALIVE=25
   #   restart: unless-stopped
+  #   privileged: false
   #   volumes:
   #     - ./wireguard-data:/etc/wireguard
   #   networks:

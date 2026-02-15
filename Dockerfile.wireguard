@@ -13,6 +13,7 @@ RUN apt-get update && \
         wireguard-tools \
         iproute2 \
         iptables \
+        curl \
         openresolv \
         procps && \
     apt-get clean && \
