@@ -134,15 +134,28 @@ curl -x http://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
 
 This image runs a WireGuard **server**, creates server keys if missing, and generates client profiles automatically.
 
-### Required runtime capabilities
+### Required runtime settings (must be enabled in platform UI)
 
-- `--cap-add=NET_ADMIN`
-- `--device=/dev/net/tun`
-- UDP port published (default `51820/udp`)
+- Capability: `NET_ADMIN`
+- Device mapping: `/dev/net/tun:/dev/net/tun`
+- Public UDP port mapping to container `51820/udp`
+
+Important:
+
+- Do **not** put these in container `Command` or `Arguments`.
+- They must be configured as runtime/container security settings in your cloud dashboard.
+
+If your provider does not support `NET_ADMIN` or `/dev/net/tun`, `:wireguard` will not start there.
 
 ### Recommended persistence
 
 Mount `/etc/wireguard` so server keys and generated clients survive container restarts.
+
+Recommended volume:
+
+```yaml
+/etc/wireguard
+```
 
 ### Optional env
 
@@ -161,9 +174,25 @@ Recommended env block (copy/paste):
 
 ```yaml
 WG_ENDPOINT: "your.public.domain.or.ip:51820"
+WG_PORT: "51820"
+WG_SERVER_CIDR: "10.66.66.1/24"
 WG_CLIENT_COUNT: "3"
+WG_CLIENT_PREFIX: "client"
 WG_DNS: "1.1.1.1"
+WG_CLIENT_ALLOWED_IPS: "0.0.0.0/0,::/0"
+WG_PERSISTENT_KEEPALIVE: "25"
+WG_HEALTH_INTERVAL: "15"
 ```
+
+Cloud deployment checklist:
+
+1. Image: `ghcr.io/foxy1402/container-vpn:wireguard`
+2. Port: expose UDP `51820` (or set `WG_PORT` to match your exposed UDP port)
+3. Capability: add `NET_ADMIN`
+4. Device: add `/dev/net/tun:/dev/net/tun`
+5. Volume: mount persistent storage at `/etc/wireguard`
+6. Env: set at least `WG_ENDPOINT` to your real public endpoint `host:port`
+7. Restart policy: `unless-stopped`
 
 Run:
 
