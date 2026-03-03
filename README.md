@@ -1,6 +1,6 @@
 # container-vpn
 
-Cloud-ready container images for three independent services:
+Cloud-ready container images for four independent services:
 
 - SOCKS5 proxy (`:socks5`)
 - HTTP/HTTPS proxy (`:http-proxy`)
@@ -40,6 +40,52 @@ docker build -f Dockerfile -t proxy:socks5 .
 docker build -f Dockerfile.http -t proxy:http-proxy .
 docker build -f Dockerfile.wireguard -t proxy:wireguard .
 ```
+
+## Portainer deploy (required fields only)
+
+Use `Containers` -> `Add container` in Portainer. Ignore optional fields unless you need customization.
+
+### SOCKS5 (`:socks5`)
+
+- Name: `socks5`
+- Image: `ghcr.io/foxy1402/container-vpn:socks5`
+- Publish a new network port: host `1080` -> container `1080` (`tcp`)
+- Environment variables:
+  - `SOCKS5_USER=your-username`
+  - `SOCKS5_PASS=your-strong-password`
+- Deploy the container
+
+### HTTP proxy (`:http-proxy`)
+
+- Name: `http-proxy`
+- Image: `ghcr.io/foxy1402/container-vpn:http-proxy`
+- Publish a new network port: host `8080` -> container `8080` (`tcp`)
+- Environment variables:
+  - `HTTP_PROXY_USER=your-username`
+  - `HTTP_PROXY_PASS=your-strong-password`
+- Deploy the container
+
+### GOST (`:gost`)
+
+- Name: `gost-proxy`
+- Image: `ghcr.io/foxy1402/container-vpn:gost`
+- Publish a new network port: host `8080` -> container `8080` (`tcp`)
+- Environment variables:
+  - `GOST_USER=your-username`
+  - `GOST_PASS=your-strong-password`
+- Deploy the container
+
+### WireGuard (`:wireguard`)
+
+- Name: `wireguard`
+- Image: `ghcr.io/foxy1402/container-vpn:wireguard`
+- Publish a new network port: host `51820` -> container `51820` (`udp`)
+- Runtime & Resources -> Capabilities: add `NET_ADMIN`
+- Runtime & Resources -> Devices: add `/dev/net/tun:/dev/net/tun`
+- Volumes: map a persistent volume/bind to `/etc/wireguard`
+- Environment variables:
+  - `WG_ENDPOINT=your.public.domain.or.ip:51820`
+- Deploy the container
 
 ## 1) SOCKS5 proxy
 
@@ -304,7 +350,7 @@ These images target Debian 13 slim style environments. Runtime dependencies are 
 
 GitHub workflow file: `.github/workflows/build.yml`
 
-- Builds all three images for `linux/amd64` and `linux/arm64`
+- Builds all four images for `linux/amd64` and `linux/arm64`
 - Pushes to GHCR on non-PR events
 - Runs service-specific smoke checks
 
@@ -319,3 +365,7 @@ GitHub workflow file: `.github/workflows/build.yml`
 
 - Quick start: `START-HERE.md`
 - Claw deployment details: `CLAW-DEPLOYMENT.md`
+
+
+
+
