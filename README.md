@@ -336,6 +336,26 @@ GOST_FORCE_IPV4: "true"
 | `WS_EXTERNAL_PORT` | `443` | Public port shown in share links |
 | `WS_EXTERNAL_TLS` | `true` | Include `security=tls` in Shadowsocks share links. Set `false` for plain HTTP setups |
 
+#### Built-in DNS over HTTPS
+
+| Variable | Default | Description |
+|---|---|---|
+| `WS_DNS_PATH` | `/dns-query` | Path of the RFC 8484 DoH endpoint. Set to `""` to disable |
+
+The container runs a built-in **DNS-over-HTTPS (DoH)** resolver at `https://yourapp.platform.com/dns-query`. It accepts standard RFC 8484 GET and POST requests, forwards the raw DNS wire-format query to `8.8.8.8` / `1.1.1.1` / `8.8.4.4` **via DNS-over-TCP** on the server side, and returns the answer.
+
+Because the DoH endpoint is on **the same host and port 443** as the proxy, it is reachable whenever the proxy itself is reachable — ISP UDP/53 blocking, DNS hijacking, and `DNS_PROBE_POSSIBLE` errors are all bypassed.
+
+**Setup in v2raytun:**
+
+1. Open v2raytun → **Settings → DNS**
+2. Set DNS mode to **HTTPS (DoH)**
+3. Paste the URL shown on your `/login` portal (e.g. `https://yourapp.onrender.com/dns-query`)
+4. Set routing/detour for this DNS server to **direct** (not through the proxy — the DoH server is the same host as the proxy, so routing it through the proxy would be circular)
+5. Save and reconnect
+
+After this, every DNS query from every app and every browser on your phone resolves through the proxy's server network. `DNS_PROBE_POSSIBLE` and similar browser DNS errors go away entirely.
+
 #### GOST proxy (internal)
 
 | Variable | Default | Description |

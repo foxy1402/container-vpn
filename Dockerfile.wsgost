@@ -63,7 +63,7 @@ ENV GOST_INTERNAL_PORT=18080 \
     GOST_SS_CIPHER=aes-256-gcm \
     GOST_MAX_CONN=200 \
     GOST_TIMEOUT=15 \
-    GOST_IDLE_TIMEOUT=300 \
+    GOST_IDLE_TIMEOUT=1800 \
     GOST_AUTH_FAIL_LIMIT=5 \
     GOST_AUTH_FAIL_WINDOW=60 \
     GOST_ALLOW_NOAUTH=false \
@@ -77,6 +77,7 @@ ENV GOST_INTERNAL_PORT=18080 \
 # WS_EXTERNAL_HOST:     public domain shown in share links (auto from Host header if unset)
 # WS_EXTERNAL_PORT:     public port shown in share links (default 443, platform TLS)
 # WS_EXTERNAL_TLS:      true = include security=tls in share links (default true)
+# WS_DNS_PATH:          DNS-over-HTTPS endpoint path (set to "" to disable)
 ENV WS_HOST=0.0.0.0 \
     WS_PORT=8080 \
     WS_PATH=/ws \
@@ -84,7 +85,8 @@ ENV WS_HOST=0.0.0.0 \
     WS_LOGIN_PASS= \
     WS_EXTERNAL_HOST= \
     WS_EXTERNAL_PORT=443 \
-    WS_EXTERNAL_TLS=true
+    WS_EXTERNAL_TLS=true \
+    WS_DNS_PATH=/dns-query
 
 # The single public port — platforms forward external HTTPS/443 here
 EXPOSE 8080

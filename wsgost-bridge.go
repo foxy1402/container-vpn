@@ -14,6 +14,7 @@
 //   WS_EXTERNAL_HOST     public hostname in share links     (default: auto from Host header)
 //   WS_EXTERNAL_PORT     public port in share links         (default: 443)
 //   WS_EXTERNAL_TLS      include TLS in share links         (default: true)
+//   WS_DNS_PATH          DNS-over-HTTPS endpoint path       (default: /dns-query, set "" to disable)
 //
 // Build: go build -o wsgost-bridge wsgost-bridge.go
 
@@ -49,6 +50,7 @@ type portalData struct {
 	SSURI     string // full ss:// share link (empty when GOST_SS_KEY not set)
 	HasSS     bool
 	PortalURL string // full bookmarkable URL of this page (auto-built from request)
+	DoHURL    string // full DNS-over-HTTPS URL (empty when WS_DNS_PATH is unset)
 	ExtHost   string
 	ExtPort   string
 	ExtTLS    bool
@@ -108,6 +110,14 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
     <div class="uribox" id="portal-url" title="Click to copy" onclick="cpEl(this)">{{.PortalURL}}</div>
     <div class="row"><button class="btn" onclick="cpEl(document.getElementById('portal-url'),this)">Copy URL</button></div>
   </div>
+{{if .DoHURL}}
+  <div class="sec">
+    <div class="sec-title">DNS over HTTPS — paste into v2raytun → DNS settings</div>
+    <div class="uribox" id="doh-url" title="Click to copy" onclick="cpEl(this)">{{.DoHURL}}</div>
+    <div class="row"><button class="btn" onclick="cpEl(document.getElementById('doh-url'),this)">Copy DoH URL</button></div>
+    <div class="note">Set this as your custom DNS server in v2raytun (DoH / HTTPS mode). All DNS on your device will resolve through the proxy server — bypasses ISP DNS filtering and fixes <b>DNS_PROBE_POSSIBLE</b> in browsers.</div>
+  </div>
+{{end}}
 {{if .HasSS}}
   <div class="sec">
     <div class="sec-title">Quick Import — v2rayNG / Shadowrocket / v2raytun</div>
@@ -263,17 +273,24 @@ func main() {
 	wsPath := envOr("WS_PATH", "/ws")
 	gostPort := envOr("GOST_INTERNAL_PORT", "18080")
 	loginPath := envOr("WS_LOGIN_PATH", "/login")
+	dnsPath := envOr("WS_DNS_PATH", "/dns-query")
 	gostAddr := "127.0.0.1:" + gostPort
 	listenAddr := wsHost + ":" + wsPort
 
 	if wsPath == loginPath {
 		log.Fatalf("[wsgost] WS_PATH and WS_LOGIN_PATH must be different (both are %q)", wsPath)
 	}
+	if dnsPath != "" && (dnsPath == wsPath || dnsPath == loginPath) {
+		log.Fatalf("[wsgost] WS_DNS_PATH %q conflicts with WS_PATH or WS_LOGIN_PATH", dnsPath)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(wsPath, makeWsHandler(gostAddr))
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc(loginPath, makePortalHandler())
+	if dnsPath != "" {
+		mux.HandleFunc(dnsPath, makeDNSHandler())
+	}
 	mux.HandleFunc("/", indexHandler)
 
 	lp := computeLoginPass()
@@ -281,6 +298,9 @@ func main() {
 	log.Printf("[wsgost] ws path       : %s  →  gost %s", wsPath, gostAddr)
 	log.Printf("[wsgost] config portal : path=%s  pass=%s", loginPath, lp)
 	log.Printf("[wsgost] access portal : https://<your-public-domain>%s?pass=%s", loginPath, lp)
+	if dnsPath != "" {
+		log.Printf("[wsgost] DoH resolver  : https://<your-public-domain>%s", dnsPath)
+	}
 
 	srv := &http.Server{
 		Addr:              listenAddr,
@@ -360,12 +380,20 @@ func buildPortalData(r *http.Request) portalData {
 	}
 	portalURL := fmt.Sprintf("%s://%s%s?pass=%s", scheme, hostPart, loginPath, computeLoginPass())
 
+	// DoH URL: same scheme+host as the portal, just a different path.
+	dnsPath := envOr("WS_DNS_PATH", "/dns-query")
+	dohURL := ""
+	if dnsPath != "" {
+		dohURL = fmt.Sprintf("%s://%s%s", scheme, hostPart, dnsPath)
+	}
+
 	ssURI := buildSSURI(extHost, extPort, wsPath, cipher, ssKey, extTLS)
 
 	return portalData{
 		SSURI:     ssURI,
 		HasSS:     ssKey != "",
 		PortalURL: portalURL,
+		DoHURL:    dohURL,
 		ExtHost:   extHost,
 		ExtPort:   extPort,
 		ExtTLS:    extTLS,
@@ -404,6 +432,101 @@ func buildSSURI(extHost, extPort, wsPath, cipher, ssKey string, tls bool) string
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprintln(w, "ok")
+}
+
+// ── DNS over HTTPS (DoH) endpoint ─────────────────────────────────────────────
+//
+// Implements RFC 8484 — accepts GET (?dns=<base64url>) and POST
+// (Content-Type: application/dns-message), forwards the raw DNS wire-format
+// query to upstream resolvers via DNS-over-TCP, and returns the answer.
+//
+// Running on port 443 of the same host as the proxy means the DoH endpoint is
+// reachable whenever the proxy itself is reachable — ISP UDP/53 blocking does
+// not affect it.  Configure v2raytun / sing-box to use this URL as the DNS
+// server so all device DNS resolves through the proxy's server network.
+
+// makeDNSHandler returns the RFC 8484 DoH handler.
+func makeDNSHandler() http.HandlerFunc {
+	upstreams := []string{"8.8.8.8:53", "1.1.1.1:53", "8.8.4.4:53"}
+	return func(w http.ResponseWriter, r *http.Request) {
+		var (
+			query []byte
+			err   error
+		)
+		switch r.Method {
+		case http.MethodGet:
+			param := r.URL.Query().Get("dns")
+			if param == "" {
+				http.Error(w, "missing dns parameter", http.StatusBadRequest)
+				return
+			}
+			query, err = base64.RawURLEncoding.DecodeString(param)
+			if err != nil {
+				http.Error(w, "invalid dns parameter", http.StatusBadRequest)
+				return
+			}
+		case http.MethodPost:
+			if !strings.Contains(r.Header.Get("Content-Type"), "application/dns-message") {
+				http.Error(w, "content-type must be application/dns-message", http.StatusUnsupportedMediaType)
+				return
+			}
+			query, err = io.ReadAll(io.LimitReader(r.Body, 2048))
+			if err != nil || len(query) == 0 {
+				http.Error(w, "failed to read body", http.StatusBadRequest)
+				return
+			}
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var resp []byte
+		for _, upstream := range upstreams {
+			if resp, err = dnsOverTCP(upstream, query); err == nil {
+				break
+			}
+			log.Printf("[wsgost] DoH upstream %s error: %v", upstream, err)
+		}
+		if err != nil {
+			http.Error(w, "all DNS upstreams failed", http.StatusBadGateway)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.WriteHeader(http.StatusOK)
+		w.Write(resp) //nolint:errcheck
+	}
+}
+
+// dnsOverTCP sends a DNS wire-format query to server using DNS-over-TCP
+// (RFC 1035 §4.2.2: 2-byte big-endian length prefix before each message).
+func dnsOverTCP(server string, query []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", server, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+
+	// Write: [2-byte length][query]
+	buf := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(buf, uint16(len(query)))
+	copy(buf[2:], query)
+	if _, err = conn.Write(buf); err != nil {
+		return nil, err
+	}
+
+	// Read response length, then response body
+	var hdr [2]byte
+	if _, err = io.ReadFull(conn, hdr[:]); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, binary.BigEndian.Uint16(hdr[:]))
+	if _, err = io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // ── WebSocket bridge ──────────────────────────────────────────────────────────

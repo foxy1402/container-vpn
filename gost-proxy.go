@@ -477,10 +477,7 @@ func (s *Server) handleSOCKS5(conn *ConnectionWrapper) {
 
 	log.Printf("%s connected to %s", clientIP, target)
 
-	// Set idle timeout and relay
-	conn.SetDeadline(time.Now().Add(s.config.IdleTimeout))
-	remote.SetDeadline(time.Now().Add(s.config.IdleTimeout))
-	s.relay(conn, remote)
+	s.relay(newIdleConn(conn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
 
 // authenticateSOCKS5 performs SOCKS5 username/password authentication
@@ -661,10 +658,7 @@ func (s *Server) handleHTTP(conn *ConnectionWrapper) {
 	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	log.Printf("%s connected to %s via HTTP", clientIP, targetAddr)
 
-	// Set idle timeout and relay
-	conn.SetDeadline(time.Now().Add(s.config.IdleTimeout))
-	remote.SetDeadline(time.Now().Add(s.config.IdleTimeout))
-	s.relay(conn, remote)
+	s.relay(newIdleConn(conn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
 
 // authenticateHTTP verifies HTTP proxy authentication
@@ -784,7 +778,39 @@ func (s *Server) dialIPv4(address string, timeout time.Duration) (net.Conn, erro
 	return nil, errors.New("no IPv4 address found")
 }
 
-// relay bidirectionally relays data between two connections
+// idleConn wraps a net.Conn and resets the deadline after every successful
+// I/O operation, implementing a true idle timeout instead of an absolute one.
+// Without this, SetDeadline(now+300s) kills any active stream older than 5
+// minutes even when data is flowing continuously (e.g. video playback).
+type idleConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func newIdleConn(c net.Conn, idle time.Duration) *idleConn {
+	c.SetDeadline(time.Now().Add(idle)) //nolint:errcheck // prime initial deadline
+	return &idleConn{Conn: c, idle: idle}
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.Conn.SetReadDeadline(time.Now().Add(c.idle)) //nolint:errcheck
+	}
+	return n, err
+}
+
+func (c *idleConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.Conn.SetWriteDeadline(time.Now().Add(c.idle)) //nolint:errcheck
+	}
+	return n, err
+}
+
+// relay bidirectionally relays data between two connections.
+// Both sides are wrapped with idleConn so the deadline resets on every
+// successful read/write — a long video stream is never killed mid-transfer.
 func (s *Server) relay(conn1, conn2 net.Conn) {
 	done := make(chan error, 2)
 
@@ -1139,10 +1165,7 @@ func (s *Server) handleShadowsocks(conn net.Conn) {
 
 	log.Printf("%s connected to %s via Shadowsocks", clientIP, target)
 
-	// Set timeouts and relay
-	ssConn.SetDeadline(time.Now().Add(s.config.IdleTimeout))
-	remote.SetDeadline(time.Now().Add(s.config.IdleTimeout))
-	s.relay(ssConn, remote)
+	s.relay(newIdleConn(ssConn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
 
 func getEnvInt(name string, defaultVal, min, max int) int {
