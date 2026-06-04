@@ -47,18 +47,19 @@ const maxWSPayload = 16 << 20 // 16 MiB — more than enough for any proxy frame
 // ── Config portal ─────────────────────────────────────────────────────────────
 
 type portalData struct {
-	SSURI     string // full ss:// share link (empty when GOST_SS_KEY not set)
-	HasSS     bool
-	PortalURL string // full bookmarkable URL of this page (auto-built from request)
-	DoHURL    string // full DNS-over-HTTPS URL (empty when WS_DNS_PATH is unset)
-	ExtHost   string
-	ExtPort   string
-	ExtTLS    bool
-	Cipher    string
-	SSKey     string
-	WSPath    string
-	GostUser  string
-	GostPass  string
+	SSURI        string // full ss:// share link (empty when GOST_SS_KEY not set)
+	HasSS        bool
+	PortalURL    string // full bookmarkable URL of this page (auto-built from request)
+	DoHURL       string // full DNS-over-HTTPS URL (empty when WS_DNS_PATH is unset)
+	ExtDoHURL    string // recommended external DoH for v2raytun Remote DNS field
+	ExtHost      string
+	ExtPort      string
+	ExtTLS       bool
+	Cipher       string
+	SSKey        string
+	WSPath       string
+	GostUser     string
+	GostPass     string
 }
 
 var portalTmpl = template.Must(template.New("portal").Parse(portalHTML))
@@ -96,28 +97,31 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
 .t-blue{background:#0284c7;color:#fff}
 .t-green{background:#059669;color:#fff}
 .t-gray{background:#334155;color:#94a3b8}
+.t-orange{background:#c2410c;color:#fff}
 .note{background:#0c1628;border-left:3px solid #0284c7;border-radius:4px;padding:12px 14px;font-size:.78rem;color:#94a3b8;line-height:1.75}
 .note b{color:#cbd5e1}
 .note code{background:#1e293b;padding:1px 5px;border-radius:3px;font-family:monospace;font-size:.85em}
+.warn{background:#1c0a00;border-left:3px solid #c2410c;border-radius:4px;padding:12px 14px;font-size:.78rem;color:#fdba74;line-height:1.75}
+.warn b{color:#fb923c}
+.warn code{background:#2c1100;padding:1px 5px;border-radius:3px;font-family:monospace;font-size:.85em}
+.steps{list-style:none;counter-reset:step}
+.steps li{counter-increment:step;padding:6px 0 6px 28px;position:relative;font-size:.78rem;color:#94a3b8;line-height:1.65}
+.steps li::before{content:counter(step);position:absolute;left:0;top:7px;background:#0284c7;color:#fff;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.65rem;font-weight:700}
+.steps b{color:#cbd5e1}
+.steps code{background:#1e293b;padding:1px 5px;border-radius:3px;font-family:monospace;font-size:.85em;color:#38bdf8}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Proxy Configuration</h1>
   <p class="sub">Scan the QR code or copy the share link directly into your proxy app.</p>
+
   <div class="sec">
     <div class="sec-title">This page — bookmark or copy the URL</div>
     <div class="uribox" id="portal-url" title="Click to copy" onclick="cpEl(this)">{{.PortalURL}}</div>
     <div class="row"><button class="btn" onclick="cpEl(document.getElementById('portal-url'),this)">Copy URL</button></div>
   </div>
-{{if .DoHURL}}
-  <div class="sec">
-    <div class="sec-title">DNS over HTTPS — paste into v2raytun → DNS settings</div>
-    <div class="uribox" id="doh-url" title="Click to copy" onclick="cpEl(this)">{{.DoHURL}}</div>
-    <div class="row"><button class="btn" onclick="cpEl(document.getElementById('doh-url'),this)">Copy DoH URL</button></div>
-    <div class="note">Set this as your custom DNS server in v2raytun (DoH / HTTPS mode). All DNS on your device will resolve through the proxy server — bypasses ISP DNS filtering and fixes <b>DNS_PROBE_POSSIBLE</b> in browsers.</div>
-  </div>
-{{end}}
+
 {{if .HasSS}}
   <div class="sec">
     <div class="sec-title">Quick Import — v2rayNG / Shadowrocket / v2raytun</div>
@@ -127,6 +131,7 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
       <button class="btn" onclick="cpEl(document.getElementById('ss-uri'),this)">Copy Link</button>
     </div>
   </div>
+
   <div class="sec">
     <div class="sec-title">Shadowsocks + WebSocket — manual settings</div>
     <table>
@@ -144,6 +149,7 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
     <div class="note"><b>Shadowsocks not enabled.</b><br>Set the <code>GOST_SS_KEY</code> env var to enable Shadowsocks and generate a scannable QR code. SOCKS5 and HTTP proxy still work over WebSocket.</div>
   </div>
 {{end}}
+
 {{if and .GostUser .GostPass}}
   <div class="sec">
     <div class="sec-title">SOCKS5 / HTTP credentials — Clash-meta, Surge, custom</div>
@@ -158,6 +164,64 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
     </table>
   </div>
 {{end}}
+
+  <!-- ── DNS FIX SECTION ─────────────────────────────────────────────────── -->
+  <div class="sec">
+    <div class="sec-title">⚠ Fix DNS leaks — required for browsers &amp; all apps</div>
+    <div class="warn">
+      <b>Why you see DNS_PROBE_POSSIBLE in Chrome / can't load Google:</b><br>
+      v2raytun uses a TUN virtual interface. Apps send raw DNS (UDP port 53) through it.
+      By default the proxy resolves these using your ISP's DNS — <b>outside</b> the tunnel.
+      The fix is to make v2raytun send domain names <em>as-is</em> through the tunnel
+      (server-side resolution) and use a reliable DoH server for the tunnel's own lookups.
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">Fix step 1 — v2raytun DNS settings (tap Settings gear → DNS)</div>
+    <div class="note">
+      <b>In v2raytun → Settings (⚙) → DNS:</b>
+    </div>
+    <ul class="steps">
+      <li>Open v2raytun → tap the <b>⚙ gear icon</b> (top right) → tap <b>DNS</b></li>
+      <li>Find <b>Remote DNS</b> field → clear it → paste:<br>
+        <div style="margin-top:6px">
+          <div class="uribox" id="ext-doh" onclick="cpEl(this)">{{.ExtDoHURL}}</div>
+          <button class="btn" style="margin-top:4px" onclick="cpEl(document.getElementById('ext-doh'),this)">Copy</button>
+        </div>
+      </li>
+      <li>Find <b>Domestic DNS</b> field (if shown) → set to <code>https://1.1.1.1/dns-query</code></li>
+      <li>Set <b>Domain Strategy</b> to <code>UseIPv4</code> (or <em>IPIfNonMatch</em> if available)</li>
+      <li>Tap <b>Save / Apply</b> then reconnect</li>
+    </ul>
+  </div>
+
+{{if .DoHURL}}
+  <div class="sec">
+    <div class="sec-title">Fix step 2 (optional) — use this proxy's own DoH resolver</div>
+    <div class="note">
+      This server also runs a built-in DoH endpoint. You can use it instead of Cloudflare/Google
+      so <em>all</em> DNS resolves through the same server network.<br><br>
+      <b>⚠ Important:</b> If you use this URL as your Remote DNS in v2raytun, set its
+      <em>detour/outbound to <b>direct</b></em> — the DoH server is the same host as the proxy,
+      so routing it <em>through</em> the proxy would be circular.
+    </div>
+    <div class="uribox" id="doh-url" title="Click to copy" onclick="cpEl(this)">{{.DoHURL}}</div>
+    <div class="row"><button class="btn" onclick="cpEl(document.getElementById('doh-url'),this)">Copy DoH URL</button></div>
+  </div>
+{{end}}
+
+  <div class="sec">
+    <div class="sec-title">Fix step 3 — re-import the QR after DNS fix</div>
+    <div class="note">
+      The share link above already includes <code>domain_strategy=remote</code>. This tells
+      v2raytun to send domain names <b>as-is</b> to the server for resolution — no local
+      pre-resolution happens. If you already have the server imported, delete it and re-scan
+      the QR / re-paste the link above to pick up this flag.
+    </div>
+  </div>
+  <!-- ── END DNS FIX SECTION ────────────────────────────────────────────── -->
+
   <div class="sec">
     <div class="note">
       <b>v2rayNG:</b> Add server → Shadowsocks → enter values above → tap <em>More options</em> → Network: <b>ws</b> → Path: <code>{{.WSPath}}</code> → save.<br><br>
@@ -387,28 +451,41 @@ func buildPortalData(r *http.Request) portalData {
 		dohURL = fmt.Sprintf("%s://%s%s", scheme, hostPart, dnsPath)
 	}
 
+	// External DoH for v2raytun's Remote DNS field.
+	// We recommend Cloudflare here — it is reliably fast and doesn't need to be
+	// routed through the proxy (v2raytun's Remote DNS server is used FOR resolving
+	// the proxy's own tunnel DNS, so it must be reachable directly).
+	// Users who want fully server-side DNS can override via WS_EXT_DOH env var.
+	extDoHURL := envOr("WS_EXT_DOH", "https://cloudflare-dns.com/dns-query")
+
 	ssURI := buildSSURI(extHost, extPort, wsPath, cipher, ssKey, extTLS)
 
 	return portalData{
-		SSURI:     ssURI,
-		HasSS:     ssKey != "",
-		PortalURL: portalURL,
-		DoHURL:    dohURL,
-		ExtHost:   extHost,
-		ExtPort:   extPort,
-		ExtTLS:    extTLS,
-		Cipher:    cipher,
-		SSKey:     ssKey,
-		WSPath:    wsPath,
-		GostUser:  os.Getenv("GOST_USER"),
-		GostPass:  os.Getenv("GOST_PASS"),
+		SSURI:        ssURI,
+		HasSS:        ssKey != "",
+		PortalURL:    portalURL,
+		DoHURL:       dohURL,
+		ExtDoHURL:    extDoHURL,
+		ExtHost:      extHost,
+		ExtPort:      extPort,
+		ExtTLS:       extTLS,
+		Cipher:       cipher,
+		SSKey:        ssKey,
+		WSPath:       wsPath,
+		GostUser:     os.Getenv("GOST_USER"),
+		GostPass:     os.Getenv("GOST_PASS"),
 	}
 }
 
 // buildSSURI constructs the Shadowsocks+WebSocket share link in the extended
 // SIP002/XRay URI format understood by v2rayNG, Shadowrocket, and v2raytun.
 //
-//	ss://BASE64URL(cipher:key)@host:port?type=ws&path=PATH&host=HOST[&security=tls&sni=HOST]#wsgost
+//	ss://BASE64URL(cipher:key)@host:port?type=ws&path=PATH&host=HOST[&security=tls&sni=HOST]&domain_strategy=remote#wsgost
+//
+// The domain_strategy=remote parameter tells sing-box / v2raytun to pass
+// domain names through the proxy as-is (SOCKS5 ATYP=0x03) rather than
+// pre-resolving them locally. This is the key fix for DNS leaks: the server
+// resolves all domains, so the client never needs to make local DNS lookups.
 func buildSSURI(extHost, extPort, wsPath, cipher, ssKey string, tls bool) string {
 	if ssKey == "" {
 		return ""
@@ -423,6 +500,11 @@ func buildSSURI(extHost, extPort, wsPath, cipher, ssKey string, tls bool) string
 		params.Set("security", "tls")
 		params.Set("sni", extHost)
 	}
+	// PATCH: domain_strategy=remote prevents client-side DNS pre-resolution.
+	// Without this, v2raytun/sing-box resolves domains before sending to the
+	// proxy, which sends IPv4 addresses through the tunnel (ATYP=0x01) and
+	// leaks DNS queries to the system/ISP resolver entirely bypassing the tunnel.
+	params.Set("domain_strategy", "remote")
 
 	return fmt.Sprintf("ss://%s@%s:%s?%s#wsgost", userinfo, extHost, extPort, params.Encode())
 }

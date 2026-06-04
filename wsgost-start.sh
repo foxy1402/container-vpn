@@ -22,6 +22,21 @@ GOST_INTERNAL_PORT="${GOST_INTERNAL_PORT:-18080}"
 # Platforms like Railway / Render / Fly inject PORT; respect that first.
 WS_PORT="${PORT:-${WS_PORT:-8080}}"
 
+# ── Render free-tier keep-alive patch ────────────────────────────────────────
+# Render free tier spins down containers after ~15 minutes of inactivity.
+# We set GOST_IDLE_TIMEOUT to a safe value so long-lived connections aren't
+# killed mid-transfer, but we also need to ensure the container itself stays
+# alive. The platform health-check (GET /health) keeps it warm as long as a
+# client is connected — but if all clients disconnect, the container will spin
+# down. This is expected behaviour on the free tier.
+#
+# PATCH: Ensure GOST_IDLE_TIMEOUT is set to at least 1800s (30 min) so
+# keep-alive pings from WS clients prevent premature TCP teardown.
+if [ -z "${GOST_IDLE_TIMEOUT}" ]; then
+    export GOST_IDLE_TIMEOUT=1800
+    log "GOST_IDLE_TIMEOUT defaulted to 1800s (Render free-tier safe default)"
+fi
+
 # ── Force GOST to bind loopback only ────────────────────────────────────────
 export GOST_HOST=127.0.0.1
 export GOST_PORT="$GOST_INTERNAL_PORT"
