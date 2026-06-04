@@ -1,7 +1,7 @@
 version: '3.8'
 
 # Multi-protocol proxy service configuration
-# Includes SOCKS5, HTTP, WireGuard, and new GOST multi-protocol proxy
+# Includes SOCKS5, HTTP, GOST multi-protocol proxy, and WSGOST WebSocket bridge
 
 services:
   # SOCKS5 Proxy Service (Port 1080)
@@ -90,34 +90,42 @@ services:
     networks:
       - proxy-net
 
-  # WireGuard VPN Server Service
-  # Note: Requires NET_ADMIN and /dev/net/tun
-  # Uncomment to generate server config + client profiles under /etc/wireguard/clients
-  # wireguard:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.wireguard
-  #   image: proxy:wireguard
-  #   container_name: proxy-wireguard
-  #   cap_add:
-  #     - NET_ADMIN
-  #   devices:
-  #     - /dev/net/tun
-  #   environment:
-  #     - WG_INTERFACE=wg0
-  #     - WG_PORT=51820
-  #     - WG_SERVER_CIDR=10.66.66.1/24
-  #     - WG_CLIENT_COUNT=3
-  #     - WG_CLIENT_PREFIX=client
-  #     - WG_ENDPOINT=your.public.ip.or.domain:51820
-  #     - WG_DNS=1.1.1.1
-  #     - WG_CLIENT_ALLOWED_IPS=0.0.0.0/0,::/0
-  #     - WG_PERSISTENT_KEEPALIVE=25
-  #   restart: unless-stopped
-  #   volumes:
-  #     - ./wireguard-data:/etc/wireguard
-  #   networks:
-  #     - proxy-net
+  # WSGOST — WebSocket-to-GOST proxy (Port 8080 internally → platform exposes as 443)
+  # Use this instead of gost-proxy on platforms that only allow HTTP/HTTPS ports.
+  # Clients connect via: ws://host:8080/ws  (or wss://host/ws via platform TLS)
+  wsgost-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.wsgost
+    image: proxy:wsgost
+    container_name: proxy-wsgost
+    ports:
+      - "8082:8080"   # host:8082 → container:8080 (avoids conflict with gost-proxy above)
+    environment:
+      # GOST credentials (same as gost-proxy)
+      - GOST_USER=testuser
+      - GOST_PASS=testpass
+      - GOST_SS_KEY=your-shadowsocks-password
+      - GOST_SS_CIPHER=aes-256-gcm
+      - GOST_MAX_CONN=200
+      - GOST_TIMEOUT=15
+      - GOST_IDLE_TIMEOUT=300
+      - GOST_ALLOW_NOAUTH=false
+      - GOST_FORCE_IPV4=true
+      # Internal GOST port (not exposed, bridge connects here)
+      - GOST_INTERNAL_PORT=18080
+      # WebSocket bridge — set WS_PATH to a random string for security
+      - WS_PORT=8080
+      - WS_PATH=/ws
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:8080/health 2>/dev/null | grep -q ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - proxy-net
 
 networks:
   proxy-net:

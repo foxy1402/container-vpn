@@ -4,8 +4,8 @@ Cloud-ready container images for four independent services:
 
 - SOCKS5 proxy (`:socks5`)
 - HTTP/HTTPS proxy (`:http-proxy`)
-- WireGuard VPN server (`:wireguard`)
 - GOST multi-protocol proxy (`:gost`)
+- WSGOST WebSocket-to-GOST bridge (`:wsgost`)
 
 Each service is deployed separately (one container per service).
 
@@ -13,8 +13,8 @@ Each service is deployed separately (one container per service).
 
 - `ghcr.io/foxy1402/container-vpn:socks5`
 - `ghcr.io/foxy1402/container-vpn:http-proxy`
-- `ghcr.io/foxy1402/container-vpn:wireguard`
 - `ghcr.io/foxy1402/container-vpn:gost`
+- `ghcr.io/foxy1402/container-vpn:wsgost`
 
 ## Images and ports
 
@@ -22,8 +22,8 @@ Each service is deployed separately (one container per service).
 |---|---|---|
 | `ghcr.io/foxy1402/container-vpn:socks5` | SOCKS5 with username/password auth | `1080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:http-proxy` | HTTP proxy + HTTPS CONNECT tunnel | `8080/tcp` |
-| `ghcr.io/foxy1402/container-vpn:wireguard` | WireGuard server that auto-generates client configs | `51820/udp` |
 | `ghcr.io/foxy1402/container-vpn:gost` | Multi-protocol on one port (SOCKS5 + HTTP CONNECT + optional Shadowsocks) | `8080/tcp` |
+| `ghcr.io/foxy1402/container-vpn:wsgost` | GOST proxy tunnelled over WebSocket — for platforms that only expose HTTP/HTTPS | `8080/tcp` |
 
 ## Build
 
@@ -38,7 +38,8 @@ Or build one:
 ```bash
 docker build -f Dockerfile -t proxy:socks5 .
 docker build -f Dockerfile.http -t proxy:http-proxy .
-docker build -f Dockerfile.wireguard -t proxy:wireguard .
+docker build -f Dockerfile.gost -t proxy:gost .
+docker build -f Dockerfile.wsgost -t proxy:wsgost .
 ```
 
 ## Portainer deploy (required fields only)
@@ -75,17 +76,18 @@ Use `Containers` -> `Add container` in Portainer. Ignore optional fields unless 
   - `GOST_PASS=your-strong-password`
 - Deploy the container
 
-### WireGuard (`:wireguard`)
+### WSGOST (`:wsgost`)
 
-- Name: `wireguard`
-- Image: `ghcr.io/foxy1402/container-vpn:wireguard`
-- Publish a new network port: host `51820` -> container `51820` (`udp`)
-- Runtime & Resources -> Capabilities: add `NET_ADMIN`
-- Runtime & Resources -> Devices: add `/dev/net/tun:/dev/net/tun`
-- Volumes: map a persistent volume/bind to `/etc/wireguard`
+- Name: `wsgost-proxy`
+- Image: `ghcr.io/foxy1402/container-vpn:wsgost`
+- Publish a new network port: host `8080` -> container `8080` (`tcp`)
 - Environment variables:
-  - `WG_ENDPOINT=your.public.domain.or.ip:51820`
+  - `GOST_USER=your-username`
+  - `GOST_PASS=your-strong-password`
+  - `WS_PATH=/your-secret-random-path`
+  - `GOST_SS_KEY=your-shadowsocks-password` (optional — enables SS + QR code)
 - Deploy the container
+- Open the config portal: `http://yourhost:8080/login?pass=<derived from GOST_PASS>`
 
 ## 1) SOCKS5 proxy
 
@@ -176,90 +178,7 @@ Test:
 curl -x http://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
 ```
 
-## 3) WireGuard VPN server
-
-This image runs a WireGuard **server**, creates server keys if missing, and generates client profiles automatically.
-
-### Required runtime settings (must be enabled in platform UI)
-
-- Capability: `NET_ADMIN`
-- Device mapping: `/dev/net/tun:/dev/net/tun`
-- Public UDP port mapping to container `51820/udp`
-
-Important:
-
-- Do **not** put these in container `Command` or `Arguments`.
-- They must be configured as runtime/container security settings in your cloud dashboard.
-
-If your provider does not support `NET_ADMIN` or `/dev/net/tun`, `:wireguard` will not start there.
-
-### Recommended persistence
-
-Mount `/etc/wireguard` so server keys and generated clients survive container restarts.
-
-Recommended volume:
-
-```yaml
-/etc/wireguard
-```
-
-### Optional env
-
-- `WG_INTERFACE` (default `wg0`)
-- `WG_PORT` (default `51820`)
-- `WG_SERVER_CIDR` (default `10.66.66.1/24`)
-- `WG_CLIENT_COUNT` (default `3`)
-- `WG_CLIENT_PREFIX` (default `client`)
-- `WG_ENDPOINT` (recommended in cloud, example `vpn.example.com:51820`)
-- `WG_DNS` (default `1.1.1.1`)
-- `WG_CLIENT_ALLOWED_IPS` (default `0.0.0.0/0,::/0`)
-- `WG_PERSISTENT_KEEPALIVE` (default `25`)
-- `WG_HEALTH_INTERVAL` (default `15`)
-
-Recommended env block (copy/paste):
-
-```yaml
-WG_ENDPOINT: "your.public.domain.or.ip:51820"
-WG_PORT: "51820"
-WG_SERVER_CIDR: "10.66.66.1/24"
-WG_CLIENT_COUNT: "3"
-WG_CLIENT_PREFIX: "client"
-WG_DNS: "1.1.1.1"
-WG_CLIENT_ALLOWED_IPS: "0.0.0.0/0,::/0"
-WG_PERSISTENT_KEEPALIVE: "25"
-WG_HEALTH_INTERVAL: "15"
-```
-
-Cloud deployment checklist:
-
-1. Image: `ghcr.io/foxy1402/container-vpn:wireguard`
-2. Port: expose UDP `51820` (or set `WG_PORT` to match your exposed UDP port)
-3. Capability: add `NET_ADMIN`
-4. Device: add `/dev/net/tun:/dev/net/tun`
-5. Volume: mount persistent storage at `/etc/wireguard`
-6. Env: set at least `WG_ENDPOINT` to your real public endpoint `host:port`
-7. Restart policy: `unless-stopped`
-
-Run:
-
-```bash
-docker run -d \
-  --name wireguard \
-  --cap-add=NET_ADMIN \
-  --device=/dev/net/tun \
-  -p 51820:51820/udp \
-  -e WG_ENDPOINT=vpn.example.com:51820 \
-  -v $(pwd)/wireguard-data:/etc/wireguard \
-  ghcr.io/foxy1402/container-vpn:wireguard
-```
-
-Generated client configs:
-
-- `./wireguard-data/clients/client1/client1.conf`
-- `./wireguard-data/clients/client2/client2.conf`
-- ...
-
-## 4) GOST multi-protocol proxy
+## 3) GOST multi-protocol proxy
 
 This image supports SOCKS5 + HTTP CONNECT on one port, and optional Shadowsocks on the same port.
 
@@ -329,6 +248,217 @@ Shadowsocks Android compatibility note:
 - `shadowsocks-android` `v5.3.4` is reported working with this server.
 - `shadowsocks-android` `v5.3.5-nightly` is reported not working in this setup.
 
+## 4) WSGOST — WebSocket-to-GOST bridge
+
+Use this image on platforms that only expose **HTTP/HTTPS** (port 443) and do not allow raw TCP/UDP ports — Railway, Render, Fly.io, Koyeb, Zeabur, Northflank, etc.
+
+Inside the container: GOST runs on loopback (`127.0.0.1:18080`, never exposed). The WebSocket bridge listens on the single public port (`8080`) and tunnels every WebSocket connection straight into GOST. The platform terminates TLS, so your client sees `wss://yourapp.platform.com/path`.
+
+```
+Client app  ──wss://──▶  Platform TLS edge  ──ws://──▶  wsgost-bridge  ──tcp──▶  gost-proxy
+```
+
+---
+
+### Quick local test
+
+```bash
+docker run -d \
+  --name wsgost \
+  -p 8080:8080 \
+  -e GOST_USER=myuser \
+  -e GOST_PASS='strong-password' \
+  -e WS_PATH='/mysecretpath' \
+  -e GOST_SS_KEY='your-shadowsocks-password' \
+  -e GOST_FORCE_IPV4=true \
+  ghcr.io/foxy1402/container-vpn:wsgost
+```
+
+Verify it is up:
+
+```bash
+curl http://127.0.0.1:8080/health   # → ok
+```
+
+---
+
+### Deploy on a PaaS platform (Railway / Render / Fly.io / Koyeb / …)
+
+All platforms follow the same pattern — only the UI differs:
+
+1. Create a new service / app and set the image to:
+   ```
+   ghcr.io/foxy1402/container-vpn:wsgost
+   ```
+2. Set environment variables (see table below). The platform automatically injects `PORT`; you do **not** need to set `WS_PORT` manually.
+3. Do **not** open or map any custom port. The platform routes `https://yourapp.platform.com` → container port automatically.
+4. Deploy. Once healthy, open the config portal (see below) to get ready-made share links.
+
+> **Fly.io** — add `[[services]]` mapping internal port `8080` to external port `443` in `fly.toml`.  
+> **Render** — set "Start Command" to `/app/wsgost-start.sh`; the image already has `CMD` set correctly.
+
+---
+
+### Environment variables
+
+#### Required
+
+| Variable | Description |
+|---|---|
+| `GOST_USER` | Proxy username for SOCKS5 / HTTP authentication |
+| `GOST_PASS` | Proxy password — also used to derive the portal password |
+
+#### Recommended
+
+```yaml
+GOST_USER: "myuser"
+GOST_PASS: "strong-password"
+WS_PATH: "/your-secret-random-path"   # change this — keeps unauthenticated bots out
+GOST_SS_KEY: "your-shadowsocks-key"   # enables Shadowsocks + QR code on /login
+GOST_FORCE_IPV4: "true"
+```
+
+#### WebSocket bridge
+
+| Variable | Default | Description |
+|---|---|---|
+| `WS_PATH` | `/ws` | WebSocket endpoint path. **Set a random string** (e.g. `/xK9mQr`) for security |
+| `PORT` / `WS_PORT` | `8080` | Container listen port. Platforms inject `PORT` automatically — leave unset |
+| `WS_HOST` | `0.0.0.0` | Bridge bind address. Leave as-is |
+
+#### Config portal
+
+| Variable | Default | Description |
+|---|---|---|
+| `WS_LOGIN_PATH` | `/login` | Path of the config portal page |
+| `WS_LOGIN_PASS` | *(derived from `GOST_PASS`)* | Portal access password. If unset, auto-derived as SHA1(GOST_PASS+"wsgost")[:12]. Set explicitly to override |
+| `WS_EXTERNAL_HOST` | *(auto from `Host` header)* | Public domain shown in share links. Leave unset on PaaS — the portal reads it from the request |
+| `WS_EXTERNAL_PORT` | `443` | Public port shown in share links |
+| `WS_EXTERNAL_TLS` | `true` | Include `security=tls` in Shadowsocks share links. Set `false` for plain HTTP setups |
+
+#### GOST proxy (internal)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GOST_SS_KEY` | *(disabled)* | Shadowsocks password. Setting this enables Shadowsocks on the same port and unlocks the QR code on `/login` |
+| `GOST_SS_CIPHER` | `aes-256-gcm` | Shadowsocks cipher. `aes-256-gcm` is universally supported |
+| `GOST_INTERNAL_PORT` | `18080` | Internal loopback port GOST listens on. No need to change |
+| `GOST_MAX_CONN` | `200` | Max concurrent connections |
+| `GOST_TIMEOUT` | `15` | Dial / connect timeout (seconds) |
+| `GOST_IDLE_TIMEOUT` | `300` | Idle connection close timeout (seconds) |
+| `GOST_FORCE_IPV4` | `true` | Prefer IPv4 for outbound traffic. Recommended on most cloud VMs |
+| `GOST_ALLOW_NOAUTH` | `false` | Allow unauthenticated proxy connections. Leave `false` |
+
+---
+
+### Config portal — `/login`
+
+The portal shows ready-made connection details and a scannable QR code. It is password-protected; the wrong password silently serves a fake landing page.
+
+**How to find your portal password:**
+
+The portal password defaults to the first 12 hex characters of SHA1(`GOST_PASS` + `"wsgost"`). The easiest way to get it is from the container startup log:
+
+```
+[wsgost] config portal : path=/login  pass=<your-portal-password>
+[wsgost] access portal : https://<your-public-domain>/login?pass=<your-portal-password>
+```
+
+Or set it explicitly with `WS_LOGIN_PASS=anything`.
+
+**Open the portal:**
+
+```
+https://yourapp.platform.com/login?pass=<your-portal-password>
+```
+
+The portal page shows:
+
+- A QR code and `ss://` share link for v2rayNG / Shadowrocket / v2raytun (when `GOST_SS_KEY` is set)
+- Manual Shadowsocks + WebSocket settings
+- SOCKS5 / HTTP credentials for Clash Meta, Surge, etc.
+- A bookmarkable URL of the portal itself (no port number — works on any PaaS)
+
+---
+
+### Connecting from client apps
+
+Replace the placeholders:
+- `yourapp.platform.com` → your actual public domain
+- `/mysecretpath` → your `WS_PATH` value
+- `myuser` / `strong-password` → your `GOST_USER` / `GOST_PASS`
+- `your-ss-password` → your `GOST_SS_KEY` value
+
+#### v2rayNG (Android) — Shadowsocks + WebSocket (recommended)
+
+Fastest method: scan the QR code or paste the `ss://` link from your `/login` portal.
+
+Manual setup:
+1. Tap `+` → **Add Shadowsocks server**
+2. Fill in:
+   - **Address:** `yourapp.platform.com`
+   - **Port:** `443`
+   - **Encryption:** `aes-256-gcm`
+   - **Password:** `your-ss-password`
+3. Tap **More options** → set **Network** to `ws`
+   - **Path:** `/mysecretpath`
+   - **Host:** `yourapp.platform.com`
+4. **TLS:** enabled — **SNI:** `yourapp.platform.com`
+5. Save and connect.
+
+#### Shadowrocket (iOS) — Shadowsocks + WebSocket
+
+Fastest: scan the QR code from `/login`.
+
+Manual setup:
+1. Tap `+` → **Type: Shadowsocks**
+2. **Host:** `yourapp.platform.com` / **Port:** `443`
+3. **Password:** `your-ss-password` / **Method:** `aes-256-gcm`
+4. **Obfs:** `websocket` / **Obfs Param:** `/mysecretpath`
+5. Toggle TLS on.
+
+#### v2raytun / Sing-box
+
+Scan the QR code from `/login` or paste the `ss://` share link. The app auto-detects Shadowsocks + WebSocket + TLS from the URI.
+
+#### Clash Meta / Mihomo
+
+Add to your proxy configuration:
+
+```yaml
+proxies:
+  - name: wsgost
+    type: ss
+    server: yourapp.platform.com
+    port: 443
+    cipher: aes-256-gcm
+    password: your-ss-password
+    plugin: v2ray-plugin
+    plugin-opts:
+      mode: websocket
+      path: /mysecretpath
+      tls: true
+      host: yourapp.platform.com
+      skip-cert-verify: false
+```
+
+#### Surge (iOS / macOS)
+
+```ini
+[Proxy]
+wsgost = ss, yourapp.platform.com, 443, encrypt-method=aes-256-gcm, password=your-ss-password, obfs=websocket, obfs-uri=/mysecretpath, tls=true
+```
+
+#### Apps that only support raw SOCKS5 / HTTP (e.g. Super Proxy)
+
+These apps send plain TCP directly — they do not speak WebSocket. They **cannot** connect to `:wsgost` without a local WebSocket tunnel shim. Use v2rayNG (Android) or Shadowrocket (iOS) instead, which handle WebSocket transport natively.
+
+If you must use a SOCKS5-only app, run a local v2ray/Xray instance that exposes a local SOCKS5 port and connects upstream to `wss://yourapp.platform.com/mysecretpath`, then point the app to `127.0.0.1:local-socks5-port`.
+
+---
+
+Health check endpoint: `GET /health` → `200 ok`
+
 ## docker compose
 
 Local test for SOCKS5 + HTTP:
@@ -337,20 +467,18 @@ Local test for SOCKS5 + HTTP:
 docker compose up -d socks5 http-proxy
 ```
 
-WireGuard example config is included but commented in `docker-compose.yml` because it requires host networking capabilities.
-
 ## Minimal OS compatibility
 
 These images target Debian 13 slim style environments. Runtime dependencies are kept small:
 
-- Proxy images: Python 3 + stdlib only
-- WireGuard image: `wireguard-tools`, `iproute2`, `iptables`, `procps`
+- Proxy images (socks5, http-proxy): Python 3 + stdlib only
+- GOST / WSGOST images: static Go binary + `ca-certificates`
 
 ## CI build
 
 GitHub workflow file: `.github/workflows/build.yml`
 
-- Builds all four images for `linux/amd64` and `linux/arm64`
+- Builds all images (`socks5`, `http-proxy`, `gost`, `wsgost`) for `linux/amd64` and `linux/arm64`
 - Pushes to GHCR on non-PR events
 - Runs service-specific smoke checks
 
@@ -359,7 +487,7 @@ GitHub workflow file: `.github/workflows/build.yml`
 - Do not deploy with weak credentials.
 - Store proxy credentials in platform secrets.
 - Restrict inbound access with firewall/security groups.
-- For WireGuard, explicitly set `WG_ENDPOINT` in cloud deployments.
+- For WSGOST, set `WS_PATH` to a random secret path to avoid unauthenticated WS probing.
 
 ## Deployment references
 

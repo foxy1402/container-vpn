@@ -24,11 +24,11 @@ jobs:
           - name: http-proxy
             dockerfile: Dockerfile.http
             context: .
-          - name: wireguard
-            dockerfile: Dockerfile.wireguard
-            context: .
           - name: gost
             dockerfile: Dockerfile.gost
+            context: .
+          - name: wsgost
+            dockerfile: Dockerfile.wsgost
             context: .
     
     permissions:
@@ -100,9 +100,6 @@ jobs:
               docker exec "$cid" python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1',8080)); s.close()"
               docker rm -f "$cid"
               ;;
-            wireguard)
-              docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }} >/dev/null
-              ;;
             gost)
               cid=$(docker run -d \
                 -e GOST_USER=testuser \
@@ -112,6 +109,19 @@ jobs:
                 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
               sleep 3
               docker exec "$cid" /app/gost-proxy-healthcheck.sh
+              docker rm -f "$cid"
+              ;;
+            wsgost)
+              cid=$(docker run -d \
+                -e GOST_USER=testuser \
+                -e GOST_PASS=testpass \
+                -e GOST_FORCE_IPV4=true \
+                -e WS_PORT=8080 \
+                -e WS_PATH=/ws \
+                -p 127.0.0.1:38080:8080 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
+              sleep 6
+              curl -sf http://127.0.0.1:38080/health | grep -q ok
               docker rm -f "$cid"
               ;;
           esac

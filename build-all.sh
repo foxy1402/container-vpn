@@ -2,7 +2,7 @@
 
 #######################################################################
 # Multi-Service Docker Image Builder
-# Builds separate images for: SOCKS5, HTTP Proxy, WireGuard
+# Builds separate images for: SOCKS5, HTTP Proxy, GOST, WSGOST
 # Each image can be deployed independently on cloud platforms
 #######################################################################
 
@@ -69,7 +69,8 @@ echo ""
 
 build_image "SOCKS5 Proxy" "Dockerfile" "socks5"
 build_image "HTTP Proxy" "Dockerfile.http" "http-proxy"
-build_image "WireGuard VPN" "Dockerfile.wireguard" "wireguard"
+build_image "GOST Multi-Protocol Proxy" "Dockerfile.gost" "gost"
+build_image "WSGOST WebSocket Bridge" "Dockerfile.wsgost" "wsgost"
 
 # Summary
 echo ""
@@ -78,17 +79,19 @@ echo -e "${GREEN}Build Complete!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "${CYAN}Local Images:${NC}"
-docker images | grep "proxy" | grep -E "socks5|http-proxy|wireguard"
+docker images | grep "proxy" | grep -E "socks5|http-proxy|gost|wsgost"
 echo ""
 echo -e "${CYAN}Available Tags:${NC}"
 echo "  • proxy:socks5"
 echo "  • proxy:http-proxy"
-echo "  • proxy:wireguard"
+echo "  • proxy:gost"
+echo "  • proxy:wsgost"
 echo ""
 echo -e "${CYAN}Registry Images (for pushing):${NC}"
 echo "  • ${REGISTRY}/${NAMESPACE}/proxy:socks5"
 echo "  • ${REGISTRY}/${NAMESPACE}/proxy:http-proxy"
-echo "  • ${REGISTRY}/${NAMESPACE}/proxy:wireguard"
+echo "  • ${REGISTRY}/${NAMESPACE}/proxy:gost"
+echo "  • ${REGISTRY}/${NAMESPACE}/proxy:wsgost"
 echo ""
 echo -e "${YELLOW}Next Steps:${NC}"
 echo "1. Test locally:"
@@ -97,7 +100,8 @@ echo ""
 echo "2. Push to registry:"
 echo "   docker push ${REGISTRY}/${NAMESPACE}/proxy:socks5"
 echo "   docker push ${REGISTRY}/${NAMESPACE}/proxy:http-proxy"
-echo "   docker push ${REGISTRY}/${NAMESPACE}/proxy:wireguard"
+echo "   docker push ${REGISTRY}/${NAMESPACE}/proxy:gost"
+echo "   docker push ${REGISTRY}/${NAMESPACE}/proxy:wsgost"
 echo ""
 echo "3. Deploy on Claw Cloud using these image URLs"
 echo ""
