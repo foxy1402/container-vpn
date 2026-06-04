@@ -1,87 +1,82 @@
 #!/bin/sh
-# wsgost-start.sh — supervises both gost-proxy (internal) and wsgost-bridge (public).
-#
-# Process layout inside the container:
-#   gost-proxy   →  127.0.0.1:${GOST_INTERNAL_PORT}  (never exposed externally)
-#   wsgost-bridge → 0.0.0.0:${WS_PORT}               (the single public port)
-#
-# If either process dies the other is killed and the container exits so the
-# platform/orchestrator can restart it.
+# wsgost-start.sh — generate Xray config from env vars and start the WS proxy.
 
-# Do NOT use set -e in a process supervisor: if a child exits non-zero the
-# shell would bail out before we can kill the other child and propagate the
-# exit code properly.  All critical error paths are checked explicitly below.
+set -eu
 
 log() { printf '[wsgost] %s\n' "$*" >&2; }
 
-# ── Port resolution ──────────────────────────────────────────────────────────
-# GOST_INTERNAL_PORT: the loopback port gost-proxy listens on (default 18080)
-GOST_INTERNAL_PORT="${GOST_INTERNAL_PORT:-18080}"
-
-# WS_PORT: the public WebSocket port.
-# Platforms like Railway / Render / Fly inject PORT; respect that first.
+WS_HOST="${WS_HOST:-0.0.0.0}"
 WS_PORT="${PORT:-${WS_PORT:-8080}}"
+WS_PATH="${WS_PATH:-/ws}"
+WS_PROTOCOL="${WS_PROTOCOL:-vless}"
+XRAY_LOG_LEVEL="${XRAY_LOG_LEVEL:-warning}"
 
-# ── Render free-tier keep-alive patch ────────────────────────────────────────
-# Render free tier spins down containers after ~15 minutes of inactivity.
-# We set GOST_IDLE_TIMEOUT to a safe value so long-lived connections aren't
-# killed mid-transfer, but we also need to ensure the container itself stays
-# alive. The platform health-check (GET /health) keeps it warm as long as a
-# client is connected — but if all clients disconnect, the container will spin
-# down. This is expected behaviour on the free tier.
-#
-# PATCH: Ensure GOST_IDLE_TIMEOUT is set to at least 1800s (30 min) so
-# keep-alive pings from WS clients prevent premature TCP teardown.
-if [ -z "${GOST_IDLE_TIMEOUT}" ]; then
-    export GOST_IDLE_TIMEOUT=1800
-    log "GOST_IDLE_TIMEOUT defaulted to 1800s (Render free-tier safe default)"
-fi
+case "$WS_PROTOCOL" in
+    vless|trojan) ;;
+    *) log "WS_PROTOCOL must be vless or trojan (got: $WS_PROTOCOL)"; exit 1 ;;
+esac
 
-# ── Force GOST to bind loopback only ────────────────────────────────────────
-export GOST_HOST=127.0.0.1
-export GOST_PORT="$GOST_INTERNAL_PORT"
-
-# Re-export resolved values so child processes pick them up
-export GOST_INTERNAL_PORT
-export WS_PORT
-
-log "GOST internal : 127.0.0.1:${GOST_INTERNAL_PORT}"
-log "WS bridge     : 0.0.0.0:${WS_PORT}  path=${WS_PATH:-/ws}"
-
-# ── Start GOST proxy in background ──────────────────────────────────────────
-/app/gost-proxy &
-GOST_PID=$!
-
-# Give GOST a moment to open its listener before the bridge dials it
-sleep 2
-
-if ! kill -0 "$GOST_PID" 2>/dev/null; then
-    log "ERROR: gost-proxy failed to start (check GOST_USER / GOST_PASS)"
+if ! printf '%s' "$WS_PORT" | grep -Eq '^[0-9]+$' || [ "$WS_PORT" -lt 1 ] || [ "$WS_PORT" -gt 65535 ]; then
+    log "Invalid WS_PORT: $WS_PORT"
     exit 1
 fi
-log "gost-proxy ready (pid=$GOST_PID)"
 
-# ── Start WebSocket bridge in background ────────────────────────────────────
-/app/wsgost-bridge &
-BRIDGE_PID=$!
+if [ "${WS_PATH#"/"}" = "$WS_PATH" ]; then
+    WS_PATH="/$WS_PATH"
+fi
 
-log "wsgost-bridge ready (pid=$BRIDGE_PID)"
-
-# ── Signal handling ──────────────────────────────────────────────────────────
-cleanup() {
-    log "Shutting down..."
-    kill "$BRIDGE_PID" 2>/dev/null
-    kill "$GOST_PID"   2>/dev/null
-    wait "$BRIDGE_PID" "$GOST_PID" 2>/dev/null
-    exit 0
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
-trap cleanup TERM INT
 
-# ── Wait for bridge; restart loop not needed — let platform restart container ─
-wait "$BRIDGE_PID"
-BRIDGE_EXIT=$?
-log "wsgost-bridge exited (code=$BRIDGE_EXIT)"  # always reached now (no set -e)
+case "$WS_PROTOCOL" in
+    vless)
+        if [ -z "${VLESS_UUID:-}" ]; then
+            log "VLESS_UUID must be set when WS_PROTOCOL=vless"
+            exit 1
+        fi
+        CLIENT_JSON=$(printf '{"id":"%s"}' "$(json_escape "$VLESS_UUID")")
+        SETTINGS_JSON=$(printf '"clients":[%s],"decryption":"none"' "$CLIENT_JSON")
+        ;;
+    trojan)
+        if [ -z "${TROJAN_PASSWORD:-}" ]; then
+            log "TROJAN_PASSWORD must be set when WS_PROTOCOL=trojan"
+            exit 1
+        fi
+        CLIENT_JSON=$(printf '{"password":"%s"}' "$(json_escape "$TROJAN_PASSWORD")")
+        SETTINGS_JSON=$(printf '"clients":[%s]' "$CLIENT_JSON")
+        ;;
+esac
 
-kill "$GOST_PID" 2>/dev/null
-wait "$GOST_PID" 2>/dev/null
-exit "$BRIDGE_EXIT"
+CONFIG_PATH="/tmp/xray-config.json"
+umask 077
+
+cat > "$CONFIG_PATH" <<EOF
+{
+  "log": {
+    "loglevel": "$(json_escape "$XRAY_LOG_LEVEL")"
+  },
+  "inbounds": [
+    {
+      "listen": "$(json_escape "$WS_HOST")",
+      "port": $WS_PORT,
+      "protocol": "$WS_PROTOCOL",
+      "settings": {
+        $SETTINGS_JSON
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "$(json_escape "$WS_PATH")"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom" }
+  ]
+}
+EOF
+
+log "Starting Xray: ${WS_PROTOCOL} over WS on ${WS_HOST}:${WS_PORT} (path=${WS_PATH})"
+exec /usr/local/bin/xray -config "$CONFIG_PATH"

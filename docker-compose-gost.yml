@@ -90,9 +90,9 @@ services:
     networks:
       - proxy-net
 
-  # WSGOST — WebSocket-to-GOST proxy (Port 8080 internally → platform exposes as 443)
-  # Use this instead of gost-proxy on platforms that only allow HTTP/HTTPS ports.
-  # Clients connect via: ws://host:8080/ws  (or wss://host/ws via platform TLS)
+  # WSGOST — VLESS/Trojan over WebSocket (Port 8080 internally → platform exposes as 443)
+  # Use this on platforms that only allow HTTP/HTTPS ports.
+  # Clients connect via: wss://host/<ws_path> (TLS terminated by platform)
   wsgost-proxy:
     build:
       context: .
@@ -102,24 +102,16 @@ services:
     ports:
       - "8082:8080"   # host:8082 → container:8080 (avoids conflict with gost-proxy above)
     environment:
-      # GOST credentials (same as gost-proxy)
-      - GOST_USER=testuser
-      - GOST_PASS=testpass
-      - GOST_SS_KEY=your-shadowsocks-password
-      - GOST_SS_CIPHER=aes-256-gcm
-      - GOST_MAX_CONN=200
-      - GOST_TIMEOUT=15
-      - GOST_IDLE_TIMEOUT=300
-      - GOST_ALLOW_NOAUTH=false
-      - GOST_FORCE_IPV4=true
-      # Internal GOST port (not exposed, bridge connects here)
-      - GOST_INTERNAL_PORT=18080
-      # WebSocket bridge — set WS_PATH to a random string for security
+      - WS_PROTOCOL=vless
+      - VLESS_UUID=your-uuid-here
       - WS_PORT=8080
       - WS_PATH=/ws
+      - XRAY_LOG_LEVEL=warning
+      # For Trojan, set WS_PROTOCOL=trojan and add:
+      # - TROJAN_PASSWORD=your-password
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:8080/health 2>/dev/null | grep -q ok"]
+      test: ["CMD", "/app/wsgost-healthcheck.sh"]
       interval: 30s
       timeout: 10s
       retries: 3

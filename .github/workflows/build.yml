@@ -113,15 +113,13 @@ jobs:
               ;;
             wsgost)
               cid=$(docker run -d \
-                -e GOST_USER=testuser \
-                -e GOST_PASS=testpass \
-                -e GOST_FORCE_IPV4=true \
-                -e WS_PORT=8080 \
+                -e WS_PROTOCOL=vless \
+                -e VLESS_UUID=11111111-1111-1111-1111-111111111111 \
                 -e WS_PATH=/ws \
                 -p 127.0.0.1:38080:8080 \
                 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
-              sleep 6
-              curl -sf http://127.0.0.1:38080/health | grep -q ok
+              sleep 3
+              docker exec "$cid" /app/wsgost-healthcheck.sh
               docker rm -f "$cid"
               ;;
           esac

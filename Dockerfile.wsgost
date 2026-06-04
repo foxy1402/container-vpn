@@ -1,99 +1,60 @@
-FROM golang:1.22-alpine AS builder
+FROM debian:13-slim AS xray-downloader
 
-RUN apk add --no-cache ca-certificates
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        wget \
+        unzip && \
+    rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
-
-# BuildKit provides TARGETOS/TARGETARCH for multi-platform builds
-ARG TARGETOS
 ARG TARGETARCH
-
-# Copy module files first for better layer caching
-COPY go.mod go.sum ./
-RUN go mod download
-
-# Copy source files (both are package main — built separately below)
-COPY gost-proxy.go wsgost-bridge.go ./
-
-# Build internal GOST multi-protocol proxy
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -a -ldflags="-w -s" \
-    -o gost-proxy gost-proxy.go
-
-# Build WebSocket bridge (stdlib-only, no extra dependencies)
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -a -ldflags="-w -s" \
-    -o wsgost-bridge wsgost-bridge.go
+RUN case "$TARGETARCH" in \
+        amd64) XRAY_ARCH="64" ;; \
+        arm64) XRAY_ARCH="arm64-v8a" ;; \
+        *) echo "Unsupported TARGETARCH: $TARGETARCH" && exit 1 ;; \
+    esac && \
+    wget -qO /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip" && \
+    unzip -q /tmp/xray.zip -d /tmp/xray && \
+    install -m 0755 /tmp/xray/xray /usr/local/bin/xray && \
+    rm -rf /tmp/xray /tmp/xray.zip
 
 # ── Final minimal image ──────────────────────────────────────────────────────
 FROM debian:13-slim
 
-LABEL org.opencontainers.image.title="WSGOST WebSocket-to-GOST Proxy"
-LABEL org.opencontainers.image.description="WebSocket bridge → GOST multi-protocol proxy. Exposes SOCKS5/HTTP/Shadowsocks over a single WebSocket port for platforms that only publish HTTP/HTTPS (port 443)."
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.title="WSGOST VLESS/Trojan over WebSocket"
+LABEL org.opencontainers.image.description="VLESS/Trojan-over-WebSocket proxy (Xray-core) for platforms that only expose HTTP/HTTPS."
+LABEL org.opencontainers.image.version="2.0.0"
 LABEL org.opencontainers.image.authors="CloudProxy"
 LABEL service.type="wsgost"
 
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates \
-        wget && \
+        ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /app
 
-COPY --from=builder /build/gost-proxy       /app/gost-proxy
-COPY --from=builder /build/wsgost-bridge    /app/wsgost-bridge
-COPY wsgost-start.sh                        /app/wsgost-start.sh
-COPY gost-proxy-healthcheck.sh              /app/gost-proxy-healthcheck.sh
+COPY --from=xray-downloader /usr/local/bin/xray /usr/local/bin/xray
+COPY wsgost-start.sh /app/wsgost-start.sh
+COPY wsgost-healthcheck.sh /app/wsgost-healthcheck.sh
 
-RUN chmod +x /app/gost-proxy /app/wsgost-bridge /app/wsgost-start.sh /app/gost-proxy-healthcheck.sh
-
-RUN useradd -r -u 1000 -s /bin/false appuser && \
+RUN chmod +x /usr/local/bin/xray /app/wsgost-start.sh /app/wsgost-healthcheck.sh && \
+    useradd -r -u 1000 -s /bin/false appuser && \
     chown -R appuser:appuser /app
 
-# ── GOST proxy (internal, bound to 127.0.0.1) ───────────────────────────────
-# GOST_INTERNAL_PORT: port GOST listens on internally (bridge targets this)
-# All other GOST_* vars are forwarded straight to gost-proxy
-ENV GOST_INTERNAL_PORT=18080 \
-    GOST_USER= \
-    GOST_PASS= \
-    GOST_SS_KEY= \
-    GOST_SS_CIPHER=aes-256-gcm \
-    GOST_MAX_CONN=200 \
-    GOST_TIMEOUT=15 \
-    GOST_IDLE_TIMEOUT=1800 \
-    GOST_AUTH_FAIL_LIMIT=5 \
-    GOST_AUTH_FAIL_WINDOW=60 \
-    GOST_ALLOW_NOAUTH=false \
-    GOST_FORCE_IPV4=true
-
-# ── WebSocket bridge (public-facing) ────────────────────────────────────────
-# WS_PORT / PORT:       the port this container listens on (platform uses PORT)
-# WS_PATH:              WebSocket endpoint path — set to a random string for security
-# WS_LOGIN_PATH:        config portal path (default /login)
-# WS_LOGIN_PASS:        config portal password (default: auto-derived from GOST_PASS)
-# WS_EXTERNAL_HOST:     public domain shown in share links (auto from Host header if unset)
-# WS_EXTERNAL_PORT:     public port shown in share links (default 443, platform TLS)
-# WS_EXTERNAL_TLS:      true = include security=tls in share links (default true)
-# WS_DNS_PATH:          DNS-over-HTTPS endpoint path (set to "" to disable)
-ENV WS_HOST=0.0.0.0 \
+ENV WS_PROTOCOL=vless \
+    WS_HOST=0.0.0.0 \
     WS_PORT=8080 \
     WS_PATH=/ws \
-    WS_LOGIN_PATH=/login \
-    WS_LOGIN_PASS= \
-    WS_EXTERNAL_HOST= \
-    WS_EXTERNAL_PORT=443 \
-    WS_EXTERNAL_TLS=true \
-    WS_DNS_PATH=/dns-query
+    VLESS_UUID= \
+    TROJAN_PASSWORD= \
+    XRAY_LOG_LEVEL=warning
 
-# The single public port — platforms forward external HTTPS/443 here
 EXPOSE 8080
 
-# Health check hits the bridge's /health endpoint
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD sh -c 'wget -qO- "http://127.0.0.1:${WS_PORT:-8080}/health" 2>/dev/null | grep -q ok || exit 1'
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD /app/wsgost-healthcheck.sh || exit 1
 
 USER appuser
 
