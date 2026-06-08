@@ -1,0 +1,69 @@
+FROM golang:1.22-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /build
+
+ARG TARGETOS
+ARG TARGETARCH
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY tlsgost-proxy.go ./
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -a -installsuffix cgo \
+    -ldflags="-w -s" \
+    -o tlsgost-proxy tlsgost-proxy.go
+
+FROM debian:13-slim
+
+LABEL org.opencontainers.image.title="TLSGost TLS Proxy"
+LABEL org.opencontainers.image.description="SOCKS5+TLS and HTTP CONNECT+TLS proxy with auto-generated or custom TLS certificates"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.authors="CloudProxy"
+LABEL service.type="tlsgost"
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+WORKDIR /app
+
+COPY --from=builder /build/tlsgost-proxy /app/tlsgost-proxy
+RUN chmod +x /app/tlsgost-proxy
+
+RUN useradd -r -u 1000 -s /bin/false appuser && \
+    chown -R appuser:appuser /app
+
+ENV TLSGOST_HOST=0.0.0.0 \
+    TLSGOST_PORT=8443 \
+    TLSGOST_USER= \
+    TLSGOST_PASS= \
+    TLSGOST_TLS_CERT= \
+    TLSGOST_TLS_KEY= \
+    TLSGOST_TLS_MIN_VERSION=1.2 \
+    TLSGOST_SNI= \
+    TLSGOST_MAX_CONN=200 \
+    TLSGOST_HANDSHAKE_TIMEOUT=30 \
+    TLSGOST_TIMEOUT=15 \
+    TLSGOST_IDLE_TIMEOUT=300 \
+    TLSGOST_AUTH_FAIL_LIMIT=5 \
+    TLSGOST_AUTH_FAIL_WINDOW=60 \
+    TLSGOST_ALLOW_NOAUTH=false \
+    TLSGOST_FORCE_IPV4=true
+
+EXPOSE 8443
+
+COPY tlsgost-healthcheck.sh /app/tlsgost-healthcheck.sh
+RUN chmod +x /app/tlsgost-healthcheck.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD /app/tlsgost-healthcheck.sh || exit 1
+
+USER appuser
+
+CMD ["/app/tlsgost-proxy"]

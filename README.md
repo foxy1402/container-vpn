@@ -1,11 +1,12 @@
 # container-vpn
 
-Cloud-ready container images for four independent services:
+Cloud-ready container images for five independent services:
 
 - SOCKS5 proxy (`:socks5`)
 - HTTP/HTTPS proxy (`:http-proxy`)
 - GOST multi-protocol proxy (`:gost`)
 - WSGOST VLESS/Trojan over WebSocket (`:wsgost`)
+- TLSGost SOCKS5+TLS / HTTP CONNECT+TLS proxy (`:tlsgost`)
 
 Each service is deployed separately (one container per service).
 
@@ -15,6 +16,7 @@ Each service is deployed separately (one container per service).
 - `ghcr.io/foxy1402/container-vpn:http-proxy`
 - `ghcr.io/foxy1402/container-vpn:gost`
 - `ghcr.io/foxy1402/container-vpn:wsgost`
+- `ghcr.io/foxy1402/container-vpn:tlsgost`
 
 ## Images and ports
 
@@ -24,6 +26,7 @@ Each service is deployed separately (one container per service).
 | `ghcr.io/foxy1402/container-vpn:http-proxy` | HTTP proxy + HTTPS CONNECT tunnel | `8080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:gost` | Multi-protocol on one port (SOCKS5 + HTTP CONNECT + optional Shadowsocks) | `8080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:wsgost` | VLESS/Trojan over WebSocket — for platforms that only expose HTTP/HTTPS | `8080/tcp` |
+| `ghcr.io/foxy1402/container-vpn:tlsgost` | SOCKS5+TLS and HTTP CONNECT+TLS on one port with auto-generated or custom TLS cert | `8443/tcp` |
 
 ## Build
 
@@ -40,6 +43,7 @@ docker build -f Dockerfile -t proxy:socks5 .
 docker build -f Dockerfile.http -t proxy:http-proxy .
 docker build -f Dockerfile.gost -t proxy:gost .
 docker build -f Dockerfile.wsgost -t proxy:wsgost .
+docker build -f Dockerfile.tlsgost -t proxy:tlsgost .
 ```
 
 ## Portainer deploy (required fields only)
@@ -86,6 +90,16 @@ Use `Containers` -> `Add container` in Portainer. Ignore optional fields unless 
   - `VLESS_UUID=your-uuid` (required when `WS_PROTOCOL=vless`)
   - `TROJAN_PASSWORD=your-password` (required when `WS_PROTOCOL=trojan`)
   - `WS_PATH=/your-secret-random-path`
+- Deploy the container
+
+### TLSGost (`:tlsgost`)
+
+- Name: `tlsgost-proxy`
+- Image: `ghcr.io/foxy1402/container-vpn:tlsgost`
+- Publish a new network port: host `8443` -> container `8443` (`tcp`)
+- Environment variables:
+  - `TLSGOST_USER=your-username`
+  - `TLSGOST_PASS=your-strong-password`
 - Deploy the container
 
 ## 1) SOCKS5 proxy
@@ -357,6 +371,46 @@ Replace the placeholders:
 
 Health checks use a port-listening probe (`/app/wsgost-healthcheck.sh`). There is no HTTP `/health` endpoint.
 
+## 5) TLSGost — SOCKS5+TLS / HTTP CONNECT+TLS proxy
+
+This image wraps SOCKS5 and HTTP CONNECT inside TLS on a single port. Clients connect over TLS and the proxy auto-detects whether the inner protocol is SOCKS5 or HTTP CONNECT. If no TLS certificate is provided, a self-signed ECDSA P-256 certificate is generated at startup.
+
+```
+Client (SOCKS5 or HTTP CONNECT over TLS) ──▶ TLSGost (TLS termination + auto-detect) ──▶ Internet
+```
+
+Required env:
+
+- `TLSGOST_USER`
+- `TLSGOST_PASS`
+
+Recommended env block (copy/paste):
+
+```yaml
+TLSGOST_USER: "your-username"
+TLSGOST_PASS: "your-strong-password"
+TLSGOST_FORCE_IPV4: "true"
+```
+
+Optional env:
+
+- `TLSGOST_HOST` (default `0.0.0.0`)
+- `TLSGOST_PORT` (default `8443`)
+- `TLSGOST_TLS_CERT` (optional, path to PEM certificate file; auto-generates self-signed if empty)
+- `TLSGOST_TLS_KEY` (optional, path to PEM private key file; required with `TLSGOST_TLS_CERT`)
+- `TLSGOST_TLS_MIN_VERSION` (default `1.2`, set to `1.3` to require TLS 1.3)
+- `TLSGOST_SNI` (optional, rejects TLS connections where client SNI does not match this value)
+- `TLSGOST_MAX_CONN` (default `200`)
+- `TLSGOST_HANDSHAKE_TIMEOUT` (default `30`)
+- `TLSGOST_TIMEOUT` (default `15`)
+- `TLSGOST_IDLE_TIMEOUT` (default `300`)
+- `TLSGOST_AUTH_FAIL_LIMIT` (default `5`)
+- `TLSGOST_AUTH_FAIL_WINDOW` (default `60`)
+- `TLSGOST_ALLOW_NOAUTH` (default `false`)
+- `TLSGOST_FORCE_IPV4` (default `true`, recommended for IPv4-only cloud egress)
+
+
+
 ## docker compose
 
 Local test for SOCKS5 + HTTP:
@@ -372,12 +426,13 @@ These images target Debian 13 slim style environments. Runtime dependencies are 
 - Proxy images (socks5, http-proxy): Python 3 + stdlib only
 - GOST image: static Go binary + `ca-certificates`
 - WSGOST image: Xray-core binary + `ca-certificates`
+- TLSGost image: static Go binary + `ca-certificates`
 
 ## CI build
 
 GitHub workflow file: `.github/workflows/build.yml`
 
-- Builds all images (`socks5`, `http-proxy`, `gost`, `wsgost`) for `linux/amd64` and `linux/arm64`
+- Builds all images (`socks5`, `http-proxy`, `gost`, `wsgost`, `tlsgost`) for `linux/amd64` and `linux/arm64`
 - Pushes to GHCR on non-PR events
 - Runs service-specific smoke checks
 
@@ -387,6 +442,7 @@ GitHub workflow file: `.github/workflows/build.yml`
 - Store proxy credentials in platform secrets.
 - Restrict inbound access with firewall/security groups.
 - For WSGOST, set `WS_PATH` to a random secret path to avoid unauthenticated WS probing.
+- For TLSGost, always provide your own TLS certificate in production. Self-signed certs are for testing only.
 
 ## Deployment references
 

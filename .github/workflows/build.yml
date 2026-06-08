@@ -30,6 +30,9 @@ jobs:
           - name: wsgost
             dockerfile: Dockerfile.wsgost
             context: .
+          - name: tlsgost
+            dockerfile: Dockerfile.tlsgost
+            context: .
     
     permissions:
       contents: read
@@ -120,6 +123,17 @@ jobs:
                 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
               sleep 3
               docker exec "$cid" /app/wsgost-healthcheck.sh
+              docker rm -f "$cid"
+              ;;
+            tlsgost)
+              cid=$(docker run -d \
+                -e TLSGOST_USER=testuser \
+                -e TLSGOST_PASS=testpass \
+                -e TLSGOST_FORCE_IPV4=true \
+                -p 127.0.0.1:48443:8443 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
+              sleep 3
+              docker exec "$cid" /app/tlsgost-healthcheck.sh
               docker rm -f "$cid"
               ;;
           esac
