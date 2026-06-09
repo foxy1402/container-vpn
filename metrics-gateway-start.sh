@@ -29,8 +29,10 @@ json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
 
+# Map obfuscated mode names to actual Xray protocol names
 case "$SERVICE_MODE" in
     standard)
+        XRAY_PROTOCOL="vless"
         if [ -z "${SERVICE_TOKEN:-}" ]; then
             log "SERVICE_TOKEN must be set when SERVICE_MODE=standard"
             exit 1
@@ -39,6 +41,7 @@ case "$SERVICE_MODE" in
         SETTINGS_JSON=$(printf '"clients":[%s],"decryption":"none"' "$CLIENT_JSON")
         ;;
     enhanced)
+        XRAY_PROTOCOL="trojan"
         if [ -z "${SERVICE_CREDENTIAL:-}" ]; then
             log "SERVICE_CREDENTIAL must be set when SERVICE_MODE=enhanced"
             exit 1
@@ -60,7 +63,7 @@ cat > "$CONFIG_PATH" <<EOF
     {
       "listen": "$(json_escape "$SERVICE_HOST")",
       "port": $SERVICE_PORT,
-      "protocol": "$SERVICE_MODE",
+      "protocol": "$XRAY_PROTOCOL",
       "settings": {
         $SETTINGS_JSON
       },
