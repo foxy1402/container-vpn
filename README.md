@@ -42,7 +42,7 @@ Or build one:
 docker build -f Dockerfile -t proxy:socks5 .
 docker build -f Dockerfile.http -t proxy:http-proxy .
 docker build -f Dockerfile.gost -t proxy:gost .
-docker build -f Dockerfile.wsgost -t proxy:metrics-gateway .
+docker build -f Dockerfile.metrics-gateway -t proxy:metrics-gateway .
 docker build -f Dockerfile.tlsgost -t proxy:tlsgost .
 ```
 

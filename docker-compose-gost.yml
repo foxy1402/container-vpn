@@ -96,7 +96,7 @@ services:
   metrics-gateway:
     build:
       context: .
-      dockerfile: Dockerfile.wsgost
+      dockerfile: Dockerfile.metrics-gateway
     image: proxy:metrics-gateway
     container_name: proxy-metrics
     ports:

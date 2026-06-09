@@ -28,7 +28,7 @@ jobs:
             dockerfile: Dockerfile.gost
             context: .
           - name: metrics-gateway
-            dockerfile: Dockerfile.wsgost
+            dockerfile: Dockerfile.metrics-gateway
             context: .
           - name: tlsgost
             dockerfile: Dockerfile.tlsgost

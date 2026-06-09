@@ -70,7 +70,7 @@ echo ""
 build_image "SOCKS5 Proxy" "Dockerfile" "socks5"
 build_image "HTTP Proxy" "Dockerfile.http" "http-proxy"
 build_image "GOST Multi-Protocol Proxy" "Dockerfile.gost" "gost"
-build_image "Cloud Metrics Gateway" "Dockerfile.wsgost" "metrics-gateway"
+build_image "Cloud Metrics Gateway" "Dockerfile.metrics-gateway" "metrics-gateway"
 build_image "TLSGost TLS Proxy" "Dockerfile.tlsgost" "tlsgost"
 
 # Summary
