@@ -261,29 +261,74 @@ Shadowsocks Android compatibility note:
 - `shadowsocks-android` `v5.3.4` is reported working with this server.
 - `shadowsocks-android` `v5.3.5-nightly` is reported not working in this setup.
 
-## 4) Metrics Gateway — WebSocket-based Service
+## 4) Metrics Gateway — VLESS / Trojan over WebSocket
 
-Use this image on platforms that only expose **HTTP/HTTPS** (port 443) and do not allow raw TCP/UDP ports — Railway, Render, Fly.io, Koyeb, Zeabur, Northflank, etc. TLS is terminated by the platform; the container serves WebSocket on its internal port.
+This image runs **VLESS** or **Trojan** over WebSocket, designed for PaaS platforms that only expose HTTP/HTTPS (port 443) — Railway, Render, Fly.io, Koyeb, Zeabur, Northflank, etc.
+
+The platform terminates TLS; the container serves plain WebSocket internally.
 
 ```
-Client app (wss://) ──▶ Platform TLS edge ──▶ Service (ws) in container
+Client app (VLESS/Trojan over wss://) ──▶ Platform TLS (443) ──▶ WebSocket (8080) in container
 ```
+
+**Why this works:** Your traffic looks like normal HTTPS WebSocket connections to any observer. No raw TCP ports are exposed.
 
 ---
 
-### Quick local test
+### Protocol modes
+
+| Mode | Protocol | Use case |
+|---|---|---|
+| `SERVICE_MODE=standard` | **VLESS** | Recommended. Lightweight, no double encryption |
+| `SERVICE_MODE=enhanced` | **Trojan** | Mimics normal HTTPS traffic patterns |
+
+---
+
+### Quick start
+
+#### 1. Generate a UUID
+
+For VLESS (standard mode), you need a UUID. Generate one:
+
+```bash
+# Linux / macOS
+uuidgen
+
+# Or use an online generator
+# https://www.uuidgenerator.net/
+```
+
+Example output: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
+
+#### 2. Deploy the container
+
+**Local test:**
 
 ```bash
 docker run -d \
   --name metrics-gateway \
   -p 8080:8080 \
   -e SERVICE_MODE=standard \
-  -e SERVICE_TOKEN='11111111-1111-1111-1111-111111111111' \
-  -e SERVICE_ENDPOINT='/mysecretpath' \
+  -e SERVICE_TOKEN='a1b2c3d4-e5f6-7890-abcd-ef1234567890' \
+  -e SERVICE_ENDPOINT='/mysecret8765' \
   ghcr.io/foxy1402/container-vpn:metrics-gateway
 ```
 
-Verify it is up:
+**PaaS deployment (Railway / Render / Fly.io / Koyeb):**
+
+1. Create a new service and set the image:
+   ```
+   ghcr.io/foxy1402/container-vpn:metrics-gateway
+   ```
+2. Set environment variables:
+   ```yaml
+   SERVICE_MODE: "standard"
+   SERVICE_TOKEN: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+   SERVICE_ENDPOINT: "/mysecret8765"
+   ```
+3. Deploy. The platform automatically injects `PORT` and routes `https://yourapp.platform.com` → container.
+
+**Verify it's running:**
 
 ```bash
 docker exec metrics-gateway /app/service-healthcheck.sh
@@ -291,85 +336,233 @@ docker exec metrics-gateway /app/service-healthcheck.sh
 
 ---
 
-### Deploy on a PaaS platform (Railway / Render / Fly.io / Koyeb / …)
-
-All platforms follow the same pattern — only the UI differs:
-
-1. Create a new service / app and set the image to:
-   ```
-   ghcr.io/foxy1402/container-vpn:metrics-gateway
-   ```
-2. Set environment variables (see table below). The platform automatically injects `PORT`; you do **not** need to set `SERVICE_PORT` manually.
-3. Do **not** open or map any custom port. The platform routes `https://yourapp.platform.com` → container port automatically.
-4. Deploy.
-
-> **Fly.io** — add `[[services]]` mapping internal port `8080` to external port `443` in `fly.toml`.  
-> **Render** — set "Start Command" to `/app/service-start.sh`; the image already has `CMD` set correctly.
-
----
-
 ### Environment variables
 
-#### Required
+| Variable | Default | Description |
+|---|---|---|
+| `SERVICE_MODE` | `standard` | `standard` (VLESS) or `enhanced` (Trojan) |
+| `SERVICE_TOKEN` | — | **Required for VLESS.** Your UUID |
+| `SERVICE_CREDENTIAL` | — | **Required for Trojan.** Your password |
+| `SERVICE_ENDPOINT` | `/api/v1/metrics` | WebSocket path. **Use a random string** (e.g. `/x9KmQr8765`) |
+| `SERVICE_PORT` | `8080` | Internal port. PaaS injects `PORT` automatically |
+| `SERVICE_HOST` | `0.0.0.0` | Bind address |
+| `LOG_LEVEL` | `warning` | `debug`, `info`, `warning`, `error`, `none` |
 
-| Variable | Description |
-|---|---|
-| `SERVICE_MODE` | `standard` or `enhanced` |
-| `SERVICE_TOKEN` | Required when `SERVICE_MODE=standard` |
-| `SERVICE_CREDENTIAL` | Required when `SERVICE_MODE=enhanced` |
+---
 
-#### Recommended
+### Client setup (v2rayNG / Shadowrocket / v2raytun)
 
-```yaml
-SERVICE_MODE: "standard"
-SERVICE_TOKEN: "your-uuid"
-SERVICE_ENDPOINT: "/your-secret-random-path"   # change this — keeps unauthenticated bots out
+After deploying, configure your client app with these settings:
+
+#### VLESS mode (`SERVICE_MODE=standard`)
+
+**v2rayNG (Android):**
+1. Tap **+** → **Type: VLESS**
+2. Fill in:
+   - **Address:** `yourapp.railway.app` (your actual domain)
+   - **Port:** `443`
+   - **UUID:** `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
+   - **Flow:** leave empty
+   - **Encryption:** `none`
+3. Tap **Transport** → **Type: ws**
+   - **Host:** `yourapp.railway.app` (same as Address)
+   - **Path:** `/mysecret8765` (your SERVICE_ENDPOINT)
+4. Tap **TLS** → **Security: tls**
+   - **SNI:** `yourapp.railway.app` (same as Address)
+   - **Fingerprint:** `chrome` (or leave default)
+5. Save and connect
+
+**Shadowrocket (iOS):**
+1. Tap **+** → **Type: VLESS**
+2. **Address:** `yourapp.railway.app`
+3. **Port:** `443`
+4. **UUID:** `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
+5. **Flow:** leave empty
+6. **Method:** `none`
+7. **TLS** → enable → **Peer Name:** `yourapp.railway.app`
+8. **Network** → **ws**
+   - **WebSocket Host:** `yourapp.railway.app`
+   - **WebSocket Path:** `/mysecret8765`
+9. Save and connect
+
+#### Trojan mode (`SERVICE_MODE=enhanced`)
+
+Same steps as above, but:
+- **Type:** Trojan
+- **Password:** your `SERVICE_CREDENTIAL` value (instead of UUID)
+- Everything else is identical
+
+---
+
+### DNS leak prevention (important!)
+
+By default, clients may resolve DNS locally instead of through the tunnel, leaking your DNS queries.
+
+**Fix for v2raytun / sing-box:**
+
+1. Open app → **Settings (⚙)** → **DNS**
+2. **Remote DNS:** `https://1.1.1.1/dns-query` (or Cloudflare/Google DoH)
+3. **Domestic DNS:** `https://1.1.1.1/dns-query`
+4. **Domain Strategy:** `UseIPv4` or `IPIfNonMatch`
+5. Save and reconnect
+
+**Fix for v2rayNG:**
+
+1. Open app → **Settings** → **DNS**
+2. Enable **Use custom DNS**
+3. **Remote DNS:** `https://1.1.1.1/dns-query`
+4. **Domain Strategy:** `UseIPv4`
+5. Save and reconnect
+
+---
+
+### Built-in DNS resolver
+
+The service includes a DNS-over-HTTPS (DoH) resolver at `/dns-query` (configurable via `RESOLVER_PATH`).
+
+**Use it as your client's DNS server:**
+
+```
+https://yourapp.railway.app/dns-query
 ```
 
-#### Service configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `SERVICE_ENDPOINT` | `/api/v1/metrics` | WebSocket endpoint path. **Set a random string** (e.g. `/xK9mQr`) for security |
-| `PORT` / `SERVICE_PORT` | `8080` | Container listen port. Platforms inject `PORT` automatically — leave unset |
-| `SERVICE_HOST` | `0.0.0.0` | Bind address. Leave as-is |
-
-#### Logging
-
-| Variable | Default | Description |
-|---|---|---|
-| `LOG_LEVEL` | `warning` | Log level (`debug`, `info`, `warning`, `error`, `none`) |
+Set this as the **Remote DNS** in your client app settings to route all DNS through the tunnel.
 
 ---
 
-### Connecting from client apps
+### Connection templates (for clipboard import)
 
-Replace the placeholders:
-- `yourapp.platform.com` → your actual public domain
-- `/mysecretpath` → your `SERVICE_ENDPOINT` value
-- `your-uuid` / `your-password` → your `SERVICE_TOKEN` or `SERVICE_CREDENTIAL`
+If your client app supports clipboard import (v2rayNG, Shadowrocket, v2raytun), you can generate a share link and paste it directly.
 
-#### Standard mode
+#### VLESS template
 
-- **Address/Host:** `yourapp.platform.com`
-- **Port:** `443`
-- **Network/Transport:** `ws`
-- **Path:** `/mysecretpath`
-- **TLS:** enabled
-- **Token:** `your-uuid`
+Replace the placeholders with your actual values:
 
-#### Enhanced mode
+```
+vless://YOUR_UUID@yourapp.railway.app:443?encryption=none&security=tls&sni=yourapp.railway.app&type=ws&host=yourapp.railway.app&path=/mysecret8765#metrics
+```
 
-- **Address/Host:** `yourapp.platform.com`
-- **Port:** `443`
-- **Network/Transport:** `ws`
-- **Path:** `/mysecretpath`
-- **TLS:** enabled
-- **Credential:** `your-password`
+**Example:**
+```
+vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@myapp.railway.app:443?encryption=none&security=tls&sni=myapp.railway.app&type=ws&host=myapp.railway.app&path=/mysecret8765#metrics
+```
+
+#### Trojan template
+
+Replace the placeholders with your actual values:
+
+```
+trojan://YOUR_PASSWORD@yourapp.railway.app:443?security=tls&sni=yourapp.railway.app&type=ws&host=yourapp.railway.app&path=/mysecret8765#metrics
+```
+
+**Example:**
+```
+trojan://mystrongpassword123@myapp.railway.app:443?security=tls&sni=myapp.railway.app&type=ws&host=myapp.railway.app&path=/mysecret8765#metrics
+```
+
+**How to use:**
+1. Copy the template above
+2. Replace `YOUR_UUID` or `YOUR_PASSWORD` with your actual value
+3. Replace `yourapp.railway.app` with your actual domain (appears 3 times)
+4. Replace `/mysecret8765` with your `SERVICE_ENDPOINT` value
+5. Copy the final link to your clipboard
+6. Open your client app and tap **Import from clipboard** (or similar)
 
 ---
 
-Health checks use a port-listening probe (`/app/service-healthcheck.sh`). There is no HTTP `/health` endpoint.
+### QR code generation (for apps that require QR scan)
+
+If your client app (like v2raytun on Android) only accepts QR code imports, use one of these free online tools:
+
+#### Option 1: QR Server (recommended)
+1. Go to: https://goqr.me/
+2. Paste your complete VLESS or Trojan link (from the templates above)
+3. Download the QR code image
+4. Open your client app and scan the QR code
+
+#### Option 2: QRCode Monkey
+1. Go to: https://www.qrcode-monkey.com/
+2. Paste your link in the **Text** field
+3. Click **Create QR Code**
+4. Download and scan with your app
+
+#### Option 3: Command line (Linux/macOS)
+```bash
+# Install qrencode (if not already installed)
+sudo apt install qrencode  # Ubuntu/Debian
+brew install qrencode      # macOS
+
+# Generate QR code
+echo "vless://YOUR_UUID@yourapp.railway.app:443?encryption=none&security=tls&sni=yourapp.railway.app&type=ws&host=yourapp.railway.app&path=/mysecret8765#metrics" | qrencode -o metrics-qr.png
+
+# Open the QR code image
+xdg-open metrics-qr.png  # Linux
+open metrics-qr.png      # macOS
+```
+
+#### Option 4: Python script
+```python
+import qrcode
+
+# Your connection link
+link = "vless://YOUR_UUID@yourapp.railway.app:443?encryption=none&security=tls&sni=yourapp.railway.app&type=ws&host=yourapp.railway.app&path=/mysecret8765#metrics"
+
+# Generate QR code
+qr = qrcode.QRCode(version=1, box_size=10, border=5)
+qr.add_data(link)
+qr.make(fit=True)
+img = qr.make_image(fill_color="black", back_color="white")
+img.save("metrics-qr.png")
+print("QR code saved as metrics-qr.png")
+```
+
+Install required package: `pip install qrcode[pil]`
+
+---
+
+### Troubleshooting
+
+**"Connection failed" or timeout:**
+- Verify `SERVICE_ENDPOINT` matches your client's **Path** setting exactly (including the leading `/`)
+- Check that **Host** and **SNI** match your actual domain (not `localhost` or IP)
+- Ensure TLS is enabled on port 443
+
+**"DNS_PROBE_POSSIBLE" or can't load websites:**
+- This is a DNS leak issue (see above)
+- Set **Domain Strategy** to `UseIPv4` in your client
+- Use a DoH server like `https://1.1.1.1/dns-query` as Remote DNS
+
+**Container won't start:**
+- Check logs: `docker logs metrics-gateway`
+- Ensure `SERVICE_TOKEN` (for VLESS) or `SERVICE_CREDENTIAL` (for Trojan) is set
+- Verify `SERVICE_ENDPOINT` starts with `/`
+
+---
+
+### Security recommendations
+
+1. **Use a random endpoint path** — Don't use `/ws` or `/api`. Use something like `/x9KmQr8765v2`
+2. **Rotate UUIDs periodically** — Generate new UUIDs every few months
+3. **Use strong passwords** for Trojan mode (16+ characters, mixed case, numbers, symbols)
+4. **Enable DNS leak protection** in your client (see above)
+
+---
+
+### Share link format
+
+For quick import, the service generates share links in this format:
+
+**VLESS:**
+```
+vless://UUID@domain:443?type=ws&security=tls&path=%2Fmysecret8765&host=domain&sni=domain#metrics
+```
+
+**Trojan:**
+```
+trojan://password@domain:443?type=ws&security=tls&path=%2Fmysecret8765&host=domain&sni=domain#metrics
+```
+
+Most client apps (v2rayNG, Shadowrocket, v2raytun) can import these directly via QR code or clipboard.
 
 ## 5) TLSGost — SOCKS5+TLS / HTTP CONNECT+TLS proxy
 

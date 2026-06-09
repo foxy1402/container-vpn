@@ -27,7 +27,7 @@ jobs:
           - name: gost
             dockerfile: Dockerfile.gost
             context: .
-          - name: wsgost
+          - name: metrics-gateway
             dockerfile: Dockerfile.wsgost
             context: .
           - name: tlsgost
@@ -114,15 +114,15 @@ jobs:
               docker exec "$cid" /app/gost-proxy-healthcheck.sh
               docker rm -f "$cid"
               ;;
-            wsgost)
+            metrics-gateway)
               cid=$(docker run -d \
-                -e WS_PROTOCOL=vless \
-                -e VLESS_UUID=11111111-1111-1111-1111-111111111111 \
-                -e WS_PATH=/ws \
+                -e SERVICE_MODE=standard \
+                -e SERVICE_TOKEN=11111111-1111-1111-1111-111111111111 \
+                -e SERVICE_ENDPOINT=/api/v1/metrics \
                 -p 127.0.0.1:38080:8080 \
                 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.service.name }})
               sleep 3
-              docker exec "$cid" /app/wsgost-healthcheck.sh
+              docker exec "$cid" /app/service-healthcheck.sh
               docker rm -f "$cid"
               ;;
             tlsgost)
