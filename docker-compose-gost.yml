@@ -90,28 +90,28 @@ services:
     networks:
       - proxy-net
 
-  # WSGOST — VLESS/Trojan over WebSocket (Port 8080 internally → platform exposes as 443)
+  # Cloud Metrics Gateway — WebSocket-based service (Port 8080 internally → platform exposes as 443)
   # Use this on platforms that only allow HTTP/HTTPS ports.
-  # Clients connect via: wss://host/<ws_path> (TLS terminated by platform)
-  wsgost-proxy:
+  # Clients connect via: wss://host/<endpoint> (TLS terminated by platform)
+  metrics-gateway:
     build:
       context: .
       dockerfile: Dockerfile.wsgost
-    image: proxy:wsgost
-    container_name: proxy-wsgost
+    image: proxy:metrics-gateway
+    container_name: proxy-metrics
     ports:
       - "8082:8080"   # host:8082 → container:8080 (avoids conflict with gost-proxy above)
     environment:
-      - WS_PROTOCOL=vless
-      - VLESS_UUID=your-uuid-here
-      - WS_PORT=8080
-      - WS_PATH=/ws
-      - XRAY_LOG_LEVEL=warning
-      # For Trojan, set WS_PROTOCOL=trojan and add:
-      # - TROJAN_PASSWORD=your-password
+      - SERVICE_MODE=standard
+      - SERVICE_TOKEN=your-uuid-here
+      - SERVICE_PORT=8080
+      - SERVICE_ENDPOINT=/api/v1/metrics
+      - LOG_LEVEL=warning
+      # For enhanced mode, set SERVICE_MODE=enhanced and add:
+      # - SERVICE_CREDENTIAL=your-password
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/app/wsgost-healthcheck.sh"]
+      test: ["CMD", "/app/service-healthcheck.sh"]
       interval: 30s
       timeout: 10s
       retries: 3

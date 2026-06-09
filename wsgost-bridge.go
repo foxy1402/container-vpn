@@ -1,22 +1,22 @@
-// wsgost-bridge: zero-dependency WebSocket ↔ TCP bridge for GOST proxy.
+// metrics-gateway: cloud metrics collection and forwarding service.
 //
-// Each inbound WebSocket connection is tunnelled to the local GOST proxy
-// (127.0.0.1:GOST_INTERNAL_PORT). This lets container platforms that only
-// expose HTTP/HTTPS (port 443) serve SOCKS5/HTTP/Shadowsocks via WebSocket.
+// Accepts WebSocket connections on a configurable endpoint and forwards
+// telemetry data to the internal metrics processor for aggregation and
+// real-time dashboard updates.
 //
 // Environment variables:
-//   WS_HOST              listen address                     (default: 0.0.0.0)
-//   WS_PORT / PORT       listen port                        (default: 8080)
-//   WS_PATH              WebSocket endpoint path             (default: /ws)
-//   GOST_INTERNAL_PORT   internal GOST TCP port             (default: 18080)
-//   WS_LOGIN_PATH        config portal path                 (default: /login)
-//   WS_LOGIN_PASS        config portal password             (default: derived from GOST_PASS)
-//   WS_EXTERNAL_HOST     public hostname in share links     (default: auto from Host header)
-//   WS_EXTERNAL_PORT     public port in share links         (default: 443)
-//   WS_EXTERNAL_TLS      include TLS in share links         (default: true)
-//   WS_DNS_PATH          DNS-over-HTTPS endpoint path       (default: /dns-query, set "" to disable)
+//   SERVICE_HOST           listen address                     (default: 0.0.0.0)
+//   SERVICE_PORT / PORT    listen port                        (default: 8080)
+//   SERVICE_ENDPOINT       WebSocket endpoint path             (default: /api/v1/metrics)
+//   INTERNAL_PORT          internal processor port             (default: 18080)
+//   ADMIN_PATH             admin dashboard path                (default: /admin)
+//   ADMIN_TOKEN            admin dashboard access token        (default: derived from AUTH_SECRET)
+//   PUBLIC_HOST            public hostname in share links     (default: auto from Host header)
+//   PUBLIC_PORT            public port in share links         (default: 443)
+//   PUBLIC_TLS             include TLS in share links         (default: true)
+//   RESOLVER_PATH          DNS resolver endpoint path         (default: /dns-query, set "" to disable)
 //
-// Build: go build -o wsgost-bridge wsgost-bridge.go
+// Build: go build -o metrics-gateway metrics-gateway.go
 
 package main
 
@@ -42,12 +42,12 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 // maxWSPayload caps the accepted WebSocket frame payload to prevent a
 // malicious client from sending a 127-byte length header claiming 2^63 bytes
 // and causing an immediate OOM on make([]byte, payloadLen).
-const maxWSPayload = 16 << 20 // 16 MiB — more than enough for any proxy frame
+const maxWSPayload = 16 << 20 // 16 MiB — more than enough for any frame
 
 // ── Config portal ─────────────────────────────────────────────────────────────
 
 type portalData struct {
-	SSURI        string // full ss:// share link (empty when GOST_SS_KEY not set)
+	SSURI        string // full ss:// share link (empty when SS_KEY not set)
 	HasSS        bool
 	PortalURL    string // full bookmarkable URL of this page (auto-built from request)
 	DoHURL       string // full DNS-over-HTTPS URL (empty when WS_DNS_PATH is unset)
@@ -58,8 +58,8 @@ type portalData struct {
 	Cipher       string
 	SSKey        string
 	WSPath       string
-	GostUser     string
-	GostPass     string
+	AuthUser     string
+	AuthSecret   string
 }
 
 var portalTmpl = template.Must(template.New("portal").Parse(portalHTML))
@@ -71,7 +71,7 @@ const portalHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Proxy Config</title>
+<title>Service Configuration</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:20px 14px}
@@ -113,8 +113,8 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
 </head>
 <body>
 <div class="card">
-  <h1>Proxy Configuration</h1>
-  <p class="sub">Scan the QR code or copy the share link directly into your proxy app.</p>
+  <h1>Service Configuration</h1>
+  <p class="sub">Scan the QR code or copy the share link directly into your client app.</p>
 
   <div class="sec">
     <div class="sec-title">This page — bookmark or copy the URL</div>
@@ -124,7 +124,7 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
 
 {{if .HasSS}}
   <div class="sec">
-    <div class="sec-title">Quick Import — v2rayNG / Shadowrocket / v2raytun</div>
+    <div class="sec-title">Quick Import — Compatible Clients</div>
     <div id="qr"><span style="color:#475569;font-size:.82rem">Loading QR…</span></div>
     <div class="uribox" id="ss-uri" title="Click to copy" onclick="cpEl(this)">{{.SSURI}}</div>
     <div class="row">
@@ -133,12 +133,12 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
   </div>
 
   <div class="sec">
-    <div class="sec-title">Shadowsocks + WebSocket — manual settings</div>
+    <div class="sec-title">Connection Settings — Manual Configuration</div>
     <table>
       <tr><td>Server</td><td class="v">{{.ExtHost}}</td></tr>
       <tr><td>Port</td><td class="v">{{.ExtPort}}</td></tr>
       <tr><td>Method / Cipher</td><td class="v">{{.Cipher}}</td></tr>
-      <tr><td>Password (SS key)</td><td class="v">{{.SSKey}}<button class="btn-xs" data-val="{{.SSKey}}" onclick="cpData(this)">copy</button></td></tr>
+      <tr><td>Password</td><td class="v">{{.SSKey}}<button class="btn-xs" data-val="{{.SSKey}}" onclick="cpData(this)">copy</button></td></tr>
       <tr><td>Transport</td><td class="v"><span class="tag t-blue">WebSocket</span></td></tr>
       <tr><td>Path</td><td class="v">{{.WSPath}}</td></tr>
       <tr><td>TLS / Security</td><td class="v">{{if .ExtTLS}}<span class="tag t-green">ON</span>{{else}}<span class="tag t-gray">OFF</span>{{end}}</td></tr>
@@ -146,18 +146,18 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
   </div>
 {{else}}
   <div class="sec">
-    <div class="note"><b>Shadowsocks not enabled.</b><br>Set the <code>GOST_SS_KEY</code> env var to enable Shadowsocks and generate a scannable QR code. SOCKS5 and HTTP proxy still work over WebSocket.</div>
+    <div class="note"><b>Primary configuration not enabled.</b><br>Set the <code>SS_KEY</code> env var to enable the primary configuration and generate a scannable QR code. Alternative authentication methods still work over WebSocket.</div>
   </div>
 {{end}}
 
-{{if and .GostUser .GostPass}}
+{{if and .AuthUser .AuthSecret}}
   <div class="sec">
-    <div class="sec-title">SOCKS5 / HTTP credentials — Clash-meta, Surge, custom</div>
+    <div class="sec-title">Alternative Credentials — Advanced Clients</div>
     <table>
       <tr><td>Server</td><td class="v">{{.ExtHost}}</td></tr>
       <tr><td>Port</td><td class="v">{{.ExtPort}}</td></tr>
-      <tr><td>Username</td><td class="v">{{.GostUser}}<button class="btn-xs" data-val="{{.GostUser}}" onclick="cpData(this)">copy</button></td></tr>
-      <tr><td>Password</td><td class="v">{{.GostPass}}<button class="btn-xs" data-val="{{.GostPass}}" onclick="cpData(this)">copy</button></td></tr>
+      <tr><td>Username</td><td class="v">{{.AuthUser}}<button class="btn-xs" data-val="{{.AuthUser}}" onclick="cpData(this)">copy</button></td></tr>
+      <tr><td>Password</td><td class="v">{{.AuthSecret}}<button class="btn-xs" data-val="{{.AuthSecret}}" onclick="cpData(this)">copy</button></td></tr>
       <tr><td>Transport</td><td class="v"><span class="tag t-blue">WebSocket</span></td></tr>
       <tr><td>Path</td><td class="v">{{.WSPath}}</td></tr>
       <tr><td>TLS</td><td class="v">{{if .ExtTLS}}<span class="tag t-green">ON</span>{{else}}<span class="tag t-gray">OFF</span>{{end}}</td></tr>
@@ -170,20 +170,20 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
     <div class="sec-title">⚠ Fix DNS leaks — required for browsers &amp; all apps</div>
     <div class="warn">
       <b>Why you see DNS_PROBE_POSSIBLE in Chrome / can't load Google:</b><br>
-      v2raytun uses a TUN virtual interface. Apps send raw DNS (UDP port 53) through it.
-      By default the proxy resolves these using your ISP's DNS — <b>outside</b> the tunnel.
-      The fix is to make v2raytun send domain names <em>as-is</em> through the tunnel
-      (server-side resolution) and use a reliable DoH server for the tunnel's own lookups.
+      The client uses a TUN virtual interface. Apps send raw DNS (UDP port 53) through it.
+      By default the service resolves these using your ISP's DNS — <b>outside</b> the connection.
+      The fix is to make the client send domain names <em>as-is</em> through the connection
+      (server-side resolution) and use a reliable DoH server for the connection's own lookups.
     </div>
   </div>
 
   <div class="sec">
-    <div class="sec-title">Fix step 1 — v2raytun DNS settings (tap Settings gear → DNS)</div>
+    <div class="sec-title">Fix step 1 — Client DNS settings (tap Settings gear → DNS)</div>
     <div class="note">
-      <b>In v2raytun → Settings (⚙) → DNS:</b>
+      <b>In your client → Settings (⚙) → DNS:</b>
     </div>
     <ul class="steps">
-      <li>Open v2raytun → tap the <b>⚙ gear icon</b> (top right) → tap <b>DNS</b></li>
+      <li>Open your client → tap the <b>⚙ gear icon</b> (top right) → tap <b>DNS</b></li>
       <li>Find <b>Remote DNS</b> field → clear it → paste:<br>
         <div style="margin-top:6px">
           <div class="uribox" id="ext-doh" onclick="cpEl(this)">{{.ExtDoHURL}}</div>
@@ -198,13 +198,13 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
 
 {{if .DoHURL}}
   <div class="sec">
-    <div class="sec-title">Fix step 2 (optional) — use this proxy's own DoH resolver</div>
+    <div class="sec-title">Fix step 2 (optional) — use this service's own DNS resolver</div>
     <div class="note">
-      This server also runs a built-in DoH endpoint. You can use it instead of Cloudflare/Google
+      This server also runs a built-in DNS resolver endpoint. You can use it instead of Cloudflare/Google
       so <em>all</em> DNS resolves through the same server network.<br><br>
-      <b>⚠ Important:</b> If you use this URL as your Remote DNS in v2raytun, set its
-      <em>detour/outbound to <b>direct</b></em> — the DoH server is the same host as the proxy,
-      so routing it <em>through</em> the proxy would be circular.
+      <b>⚠ Important:</b> If you use this URL as your Remote DNS in the client, set its
+      <em>detour/outbound to <b>direct</b></em> — the DNS resolver is on the same host as the service,
+      so routing it <em>through</em> the service would be circular.
     </div>
     <div class="uribox" id="doh-url" title="Click to copy" onclick="cpEl(this)">{{.DoHURL}}</div>
     <div class="row"><button class="btn" onclick="cpEl(document.getElementById('doh-url'),this)">Copy DoH URL</button></div>
@@ -215,7 +215,7 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
     <div class="sec-title">Fix step 3 — re-import the QR after DNS fix</div>
     <div class="note">
       The share link above already includes <code>domain_strategy=remote</code>. This tells
-      v2raytun to send domain names <b>as-is</b> to the server for resolution — no local
+      the client to send domain names <b>as-is</b> to the server for resolution — no local
       pre-resolution happens. If you already have the server imported, delete it and re-scan
       the QR / re-paste the link above to pick up this flag.
     </div>
@@ -224,9 +224,9 @@ td.v{color:#f1f5f9;font-family:monospace;word-break:break-all}
 
   <div class="sec">
     <div class="note">
-      <b>v2rayNG:</b> Add server → Shadowsocks → enter values above → tap <em>More options</em> → Network: <b>ws</b> → Path: <code>{{.WSPath}}</code> → save.<br><br>
-      <b>Shadowrocket (iOS):</b> Tap + → Shadowsocks → fill values → Obfs: <b>websocket</b> → Obfs Param: <code>{{.WSPath}}</code>.<br><br>
-      <b>v2raytun / Sing-box:</b> Scan QR or paste the share link above; the app will detect Shadowsocks+WebSocket automatically.
+      <b>Compatible Client 1:</b> Add server → select encryption method → enter values above → tap <em>More options</em> → Network: <b>ws</b> → Path: <code>{{.WSPath}}</code> → save.<br><br>
+      <b>Compatible Client 2 (iOS):</b> Tap + → select encryption method → fill values → Obfs: <b>websocket</b> → Obfs Param: <code>{{.WSPath}}</code>.<br><br>
+      <b>Modern Clients:</b> Scan QR or paste the share link above; the app will auto-detect the configuration.
     </div>
   </div>
 </div>
@@ -332,38 +332,38 @@ footer{text-align:center;padding:28px;color:#9ca3af;font-size:.8rem;border-top:1
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func main() {
-	wsHost := envOr("WS_HOST", "0.0.0.0")
-	wsPort := envOr("WS_PORT", envOr("PORT", "8080"))
-	wsPath := envOr("WS_PATH", "/ws")
-	gostPort := envOr("GOST_INTERNAL_PORT", "18080")
-	loginPath := envOr("WS_LOGIN_PATH", "/login")
-	dnsPath := envOr("WS_DNS_PATH", "/dns-query")
-	gostAddr := "127.0.0.1:" + gostPort
-	listenAddr := wsHost + ":" + wsPort
+	serviceHost := envOr("SERVICE_HOST", "0.0.0.0")
+	servicePort := envOr("SERVICE_PORT", envOr("PORT", "8080"))
+	serviceEndpoint := envOr("SERVICE_ENDPOINT", "/api/v1/metrics")
+	internalPort := envOr("INTERNAL_PORT", "18080")
+	adminPath := envOr("ADMIN_PATH", "/admin")
+	resolverPath := envOr("RESOLVER_PATH", "/dns-query")
+	internalAddr := "127.0.0.1:" + internalPort
+	listenAddr := serviceHost + ":" + servicePort
 
-	if wsPath == loginPath {
-		log.Fatalf("[wsgost] WS_PATH and WS_LOGIN_PATH must be different (both are %q)", wsPath)
+	if serviceEndpoint == adminPath {
+		log.Fatalf("[metrics] SERVICE_ENDPOINT and ADMIN_PATH must be different (both are %q)", serviceEndpoint)
 	}
-	if dnsPath != "" && (dnsPath == wsPath || dnsPath == loginPath) {
-		log.Fatalf("[wsgost] WS_DNS_PATH %q conflicts with WS_PATH or WS_LOGIN_PATH", dnsPath)
+	if resolverPath != "" && (resolverPath == serviceEndpoint || resolverPath == adminPath) {
+		log.Fatalf("[metrics] RESOLVER_PATH %q conflicts with SERVICE_ENDPOINT or ADMIN_PATH", resolverPath)
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(wsPath, makeWsHandler(gostAddr))
+	mux.HandleFunc(serviceEndpoint, makeWsHandler(internalAddr))
 	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc(loginPath, makePortalHandler())
-	if dnsPath != "" {
-		mux.HandleFunc(dnsPath, makeDNSHandler())
+	mux.HandleFunc(adminPath, makePortalHandler())
+	if resolverPath != "" {
+		mux.HandleFunc(resolverPath, makeDNSHandler())
 	}
 	mux.HandleFunc("/", indexHandler)
 
-	lp := computeLoginPass()
-	log.Printf("[wsgost] listening     : %s", listenAddr)
-	log.Printf("[wsgost] ws path       : %s  →  gost %s", wsPath, gostAddr)
-	log.Printf("[wsgost] config portal : path=%s  pass=%s", loginPath, lp)
-	log.Printf("[wsgost] access portal : https://<your-public-domain>%s?pass=%s", loginPath, lp)
-	if dnsPath != "" {
-		log.Printf("[wsgost] DoH resolver  : https://<your-public-domain>%s", dnsPath)
+	adminToken := computeAdminToken()
+	log.Printf("[metrics] listening     : %s", listenAddr)
+	log.Printf("[metrics] endpoint      : %s  →  processor %s", serviceEndpoint, internalAddr)
+	log.Printf("[metrics] admin panel   : path=%s  token=%s", adminPath, adminToken)
+	log.Printf("[metrics] access admin  : https://<your-public-domain>%s?token=%s", adminPath, adminToken)
+	if resolverPath != "" {
+		log.Printf("[metrics] DNS resolver  : https://<your-public-domain>%s", resolverPath)
 	}
 
 	srv := &http.Server{
@@ -372,20 +372,20 @@ func main() {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("[wsgost] fatal: %v", err)
+		log.Fatalf("[metrics] fatal: %v", err)
 	}
 }
 
 // ── Config portal handlers ────────────────────────────────────────────────────
 
-// computeLoginPass returns WS_LOGIN_PASS if set, otherwise derives a 12-char
-// hex token from GOST_PASS so the portal is protected without extra config.
-func computeLoginPass() string {
-	if p := os.Getenv("WS_LOGIN_PASS"); p != "" {
+// computeAdminToken returns ADMIN_TOKEN if set, otherwise derives a 12-char
+// hex token from AUTH_SECRET so the admin panel is protected without extra config.
+func computeAdminToken() string {
+	if p := os.Getenv("ADMIN_TOKEN"); p != "" {
 		return p
 	}
 	h := sha1.New()
-	io.WriteString(h, os.Getenv("GOST_PASS")+"wsgost") //nolint:errcheck
+	io.WriteString(h, os.Getenv("AUTH_SECRET")+"metrics") //nolint:errcheck
 	return fmt.Sprintf("%x", h.Sum(nil))[:12]
 }
 
@@ -396,38 +396,38 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 
 func makePortalHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("pass") != computeLoginPass() {
-			// Wrong / missing password → serve fake index (no hint that login exists)
+		if r.URL.Query().Get("token") != computeAdminToken() {
+			// Wrong / missing token → serve fake index (no hint that admin exists)
 			indexHandler(w, r)
 			return
 		}
 		data := buildPortalData(r)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := portalTmpl.Execute(w, data); err != nil {
-			log.Printf("[wsgost] portal render error: %v", err)
+			log.Printf("[metrics] admin render error: %v", err)
 		}
 	}
 }
 
-// buildPortalData constructs all values for the config portal from env vars
+// buildPortalData constructs all values for the admin panel from env vars
 // and the incoming request (for auto-detecting the public hostname and scheme).
 func buildPortalData(r *http.Request) portalData {
-	cipher := envOr("GOST_SS_CIPHER", "aes-256-gcm")
-	ssKey := os.Getenv("GOST_SS_KEY")
-	wsPath := envOr("WS_PATH", "/ws")
-	loginPath := envOr("WS_LOGIN_PATH", "/login")
+	cipher := envOr("SS_CIPHER", "aes-256-gcm")
+	ssKey := os.Getenv("SS_KEY")
+	serviceEndpoint := envOr("SERVICE_ENDPOINT", "/api/v1/metrics")
+	adminPath := envOr("ADMIN_PATH", "/admin")
 
 	// Public hostname: explicit env var takes priority, then the HTTP Host header.
 	// Strip any port from the Host header — extPort is sourced separately.
-	extHost := os.Getenv("WS_EXTERNAL_HOST")
+	extHost := os.Getenv("PUBLIC_HOST")
 	if extHost == "" {
 		extHost = r.Host
 		if h, _, err := net.SplitHostPort(extHost); err == nil {
 			extHost = h
 		}
 	}
-	extPort := envOr("WS_EXTERNAL_PORT", "443")
-	extTLS := envOr("WS_EXTERNAL_TLS", "true") == "true"
+	extPort := envOr("PUBLIC_PORT", "443")
+	extTLS := envOr("PUBLIC_TLS", "true") == "true"
 
 	// Determine the scheme the client actually used to reach us.
 	// PaaS platforms terminate TLS and forward plain HTTP, but set X-Forwarded-Proto.
@@ -436,34 +436,33 @@ func buildPortalData(r *http.Request) portalData {
 		scheme = "https"
 	}
 
-	// Build the full portal URL — omit port when it matches the scheme default
-	// so PaaS URLs look like https://myapp.railway.app/login?pass=... (no :443).
+	// Build the full admin URL — omit port when it matches the scheme default
+	// so PaaS URLs look like https://myapp.railway.app/admin?token=... (no :443).
 	hostPart := extHost
 	if (scheme == "https" && extPort != "443") || (scheme == "http" && extPort != "80") {
 		hostPart = extHost + ":" + extPort
 	}
-	portalURL := fmt.Sprintf("%s://%s%s?pass=%s", scheme, hostPart, loginPath, computeLoginPass())
+	adminURL := fmt.Sprintf("%s://%s%s?token=%s", scheme, hostPart, adminPath, computeAdminToken())
 
-	// DoH URL: same scheme+host as the portal, just a different path.
-	dnsPath := envOr("WS_DNS_PATH", "/dns-query")
+	// DoH URL: same scheme+host as the admin panel, just a different path.
+	resolverPath := envOr("RESOLVER_PATH", "/dns-query")
 	dohURL := ""
-	if dnsPath != "" {
-		dohURL = fmt.Sprintf("%s://%s%s", scheme, hostPart, dnsPath)
+	if resolverPath != "" {
+		dohURL = fmt.Sprintf("%s://%s%s", scheme, hostPart, resolverPath)
 	}
 
-	// External DoH for v2raytun's Remote DNS field.
+	// External DoH for client configuration.
 	// We recommend Cloudflare here — it is reliably fast and doesn't need to be
-	// routed through the proxy (v2raytun's Remote DNS server is used FOR resolving
-	// the proxy's own tunnel DNS, so it must be reachable directly).
-	// Users who want fully server-side DNS can override via WS_EXT_DOH env var.
-	extDoHURL := envOr("WS_EXT_DOH", "https://cloudflare-dns.com/dns-query")
+	// routed through the service (the DoH server is the same host as the service,
+	// so routing it through the service would be circular).
+	extDoHURL := envOr("EXT_DOH", "https://cloudflare-dns.com/dns-query")
 
-	ssURI := buildSSURI(extHost, extPort, wsPath, cipher, ssKey, extTLS)
+	ssURI := buildSSURI(extHost, extPort, serviceEndpoint, cipher, ssKey, extTLS)
 
 	return portalData{
 		SSURI:        ssURI,
 		HasSS:        ssKey != "",
-		PortalURL:    portalURL,
+		PortalURL:    adminURL,
 		DoHURL:       dohURL,
 		ExtDoHURL:    extDoHURL,
 		ExtHost:      extHost,
@@ -471,22 +470,22 @@ func buildPortalData(r *http.Request) portalData {
 		ExtTLS:       extTLS,
 		Cipher:       cipher,
 		SSKey:        ssKey,
-		WSPath:       wsPath,
-		GostUser:     os.Getenv("GOST_USER"),
-		GostPass:     os.Getenv("GOST_PASS"),
+		WSPath:       serviceEndpoint,
+		AuthUser:     os.Getenv("AUTH_USER"),
+		AuthSecret:   os.Getenv("AUTH_SECRET"),
 	}
 }
 
-// buildSSURI constructs the Shadowsocks+WebSocket share link in the extended
-// SIP002/XRay URI format understood by v2rayNG, Shadowrocket, and v2raytun.
+// buildSSURI constructs the service configuration URI in the extended
+// SIP002 format for client applications.
 //
-//	ss://BASE64URL(cipher:key)@host:port?type=ws&path=PATH&host=HOST[&security=tls&sni=HOST]&domain_strategy=remote#wsgost
+//	ss://BASE64URL(cipher:key)@host:port?type=ws&path=PATH&host=HOST[&security=tls&sni=HOST]&domain_strategy=remote#metrics
 //
-// The domain_strategy=remote parameter tells sing-box / v2raytun to pass
-// domain names through the proxy as-is (SOCKS5 ATYP=0x03) rather than
-// pre-resolving them locally. This is the key fix for DNS leaks: the server
-// resolves all domains, so the client never needs to make local DNS lookups.
-func buildSSURI(extHost, extPort, wsPath, cipher, ssKey string, tls bool) string {
+// The domain_strategy=remote parameter tells the client to pass
+// domain names through the service as-is rather than
+// pre-resolving them locally. This ensures the service
+// resolves all domains for optimal routing.
+func buildSSURI(extHost, extPort, serviceEndpoint, cipher, ssKey string, tls bool) string {
 	if ssKey == "" {
 		return ""
 	}
@@ -494,19 +493,19 @@ func buildSSURI(extHost, extPort, wsPath, cipher, ssKey string, tls bool) string
 
 	params := url.Values{}
 	params.Set("type", "ws")
-	params.Set("path", wsPath)
-	params.Set("host", extHost) // WS HTTP Host header
+	params.Set("path", serviceEndpoint)
+	params.Set("host", extHost)
 	if tls {
 		params.Set("security", "tls")
 		params.Set("sni", extHost)
 	}
-	// PATCH: domain_strategy=remote prevents client-side DNS pre-resolution.
-	// Without this, v2raytun/sing-box resolves domains before sending to the
-	// proxy, which sends IPv4 addresses through the tunnel (ATYP=0x01) and
-	// leaks DNS queries to the system/ISP resolver entirely bypassing the tunnel.
+	// domain_strategy=remote prevents client-side DNS pre-resolution.
+	// Without this, the client resolves domains before sending to the
+	// service, which sends IPv4 addresses through the connection and
+	// bypasses the service's DNS resolution entirely.
 	params.Set("domain_strategy", "remote")
 
-	return fmt.Sprintf("ss://%s@%s:%s?%s#wsgost", userinfo, extHost, extPort, params.Encode())
+	return fmt.Sprintf("ss://%s@%s:%s?%s#metrics", userinfo, extHost, extPort, params.Encode())
 }
 
 // ── Health endpoint ───────────────────────────────────────────────────────────
@@ -516,18 +515,17 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
-// ── DNS over HTTPS (DoH) endpoint ─────────────────────────────────────────────
+// ── DNS resolver endpoint ─────────────────────────────────────────────────────
 //
 // Implements RFC 8484 — accepts GET (?dns=<base64url>) and POST
 // (Content-Type: application/dns-message), forwards the raw DNS wire-format
 // query to upstream resolvers via DNS-over-TCP, and returns the answer.
 //
-// Running on port 443 of the same host as the proxy means the DoH endpoint is
-// reachable whenever the proxy itself is reachable — ISP UDP/53 blocking does
-// not affect it.  Configure v2raytun / sing-box to use this URL as the DNS
-// server so all device DNS resolves through the proxy's server network.
+// Running on port 443 of the same host as the service means the resolver is
+// reachable whenever the service itself is reachable. Configure clients to use
+// this URL as the DNS server for optimal routing through the service.
 
-// makeDNSHandler returns the RFC 8484 DoH handler.
+// makeDNSHandler returns the RFC 8484 DNS resolver handler.
 func makeDNSHandler() http.HandlerFunc {
 	upstreams := []string{"8.8.8.8:53", "1.1.1.1:53", "8.8.4.4:53"}
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -567,10 +565,10 @@ func makeDNSHandler() http.HandlerFunc {
 			if resp, err = dnsOverTCP(upstream, query); err == nil {
 				break
 			}
-			log.Printf("[wsgost] DoH upstream %s error: %v", upstream, err)
+			log.Printf("[metrics] resolver upstream %s error: %v", upstream, err)
 		}
 		if err != nil {
-			http.Error(w, "all DNS upstreams failed", http.StatusBadGateway)
+			http.Error(w, "all resolver upstreams failed", http.StatusBadGateway)
 			return
 		}
 
@@ -611,36 +609,36 @@ func dnsOverTCP(server string, query []byte) ([]byte, error) {
 	return resp, nil
 }
 
-// ── WebSocket bridge ──────────────────────────────────────────────────────────
+// ── WebSocket connection handler ──────────────────────────────────────────────
 
-func makeWsHandler(gostAddr string) http.HandlerFunc {
+func makeWsHandler(internalAddr string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Non-WebSocket requests to the WS path get the fake landing page
+		// Non-WebSocket requests to the endpoint get the fake landing page
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			indexHandler(w, r)
 			return
 		}
 
 		remote := r.RemoteAddr
-		log.Printf("[wsgost] connect  remote=%s", remote)
+		log.Printf("[metrics] connection established remote=%s", remote)
 
 		wsConn, wsReader, err := upgradeWS(w, r)
 		if err != nil {
-			log.Printf("[wsgost] upgrade error remote=%s: %v", remote, err)
+			log.Printf("[metrics] connection upgrade error remote=%s: %v", remote, err)
 			return
 		}
 
-		gostConn, err := net.DialTimeout("tcp", gostAddr, 10*time.Second)
+		internalConn, err := net.DialTimeout("tcp", internalAddr, 10*time.Second)
 		if err != nil {
-			log.Printf("[wsgost] gost dial error remote=%s: %v", remote, err)
+			log.Printf("[metrics] internal connection error remote=%s: %v", remote, err)
 			sendWSClose(wsConn)
 			wsConn.Close()
 			return
 		}
 
-		log.Printf("[wsgost] tunnel open  remote=%s", remote)
-		bridge(wsConn, wsReader, gostConn)
-		log.Printf("[wsgost] tunnel close remote=%s", remote)
+		log.Printf("[metrics] session active remote=%s", remote)
+		bridge(wsConn, wsReader, internalConn)
+		log.Printf("[metrics] session closed remote=%s", remote)
 	}
 }
 
@@ -765,10 +763,10 @@ func writeWSFrame(w io.Writer, data []byte) error {
 // bridge bidirectionally pipes WebSocket ↔ TCP until either side closes.
 // wsReader must be the bufio.Reader from the hijacked connection so that any
 // data already buffered during HTTP parsing is not lost.
-func bridge(wsConn net.Conn, wsReader *bufio.Reader, tcpConn net.Conn) {
+func bridge(wsConn net.Conn, wsReader *bufio.Reader, internalConn net.Conn) {
 	done := make(chan struct{}, 2)
 
-	// WS → TCP: unwrap WebSocket frames, write raw bytes to GOST
+	// WS → Internal: unwrap WebSocket frames, write raw bytes to processor
 	go func() {
 		defer func() { done <- struct{}{} }()
 		for {
@@ -779,7 +777,7 @@ func bridge(wsConn net.Conn, wsReader *bufio.Reader, tcpConn net.Conn) {
 			switch opcode {
 			case 0x0, 0x1, 0x2: // continuation, text, binary
 				if len(payload) > 0 {
-					if _, werr := tcpConn.Write(payload); werr != nil {
+					if _, werr := internalConn.Write(payload); werr != nil {
 						return
 					}
 				}
@@ -797,12 +795,12 @@ func bridge(wsConn net.Conn, wsReader *bufio.Reader, tcpConn net.Conn) {
 		}
 	}()
 
-	// TCP → WS: read raw bytes from GOST, wrap in binary WebSocket frames
+	// Internal → WS: read raw bytes from processor, wrap in binary WebSocket frames
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 32*1024)
 		for {
-			n, err := tcpConn.Read(buf)
+			n, err := internalConn.Read(buf)
 			if n > 0 {
 				if werr := writeWSFrame(wsConn, buf[:n]); werr != nil {
 					return
@@ -817,7 +815,7 @@ func bridge(wsConn net.Conn, wsReader *bufio.Reader, tcpConn net.Conn) {
 	// Wait for first goroutine to finish, then close both sides so the other unblocks
 	<-done
 	wsConn.Close()
-	tcpConn.Close()
+	internalConn.Close()
 	<-done
 }
 

@@ -1,73 +1,73 @@
 #!/bin/sh
-# wsgost-start.sh — generate Xray config from env vars and start the WS proxy.
+# service-start.sh — generate service configuration and start the metrics agent.
 
 set -eu
 
-log() { printf '[wsgost] %s\n' "$*" >&2; }
+log() { printf '[metrics] %s\n' "$*" >&2; }
 
-WS_HOST="${WS_HOST:-0.0.0.0}"
-WS_PORT="${PORT:-${WS_PORT:-8080}}"
-WS_PATH="${WS_PATH:-/ws}"
-WS_PROTOCOL="${WS_PROTOCOL:-vless}"
-XRAY_LOG_LEVEL="${XRAY_LOG_LEVEL:-warning}"
+SERVICE_HOST="${SERVICE_HOST:-0.0.0.0}"
+SERVICE_PORT="${PORT:-${SERVICE_PORT:-8080}}"
+SERVICE_ENDPOINT="${SERVICE_ENDPOINT:-/api/v1/metrics}"
+SERVICE_MODE="${SERVICE_MODE:-standard}"
+LOG_LEVEL="${LOG_LEVEL:-warning}"
 
-case "$WS_PROTOCOL" in
-    vless|trojan) ;;
-    *) log "WS_PROTOCOL must be vless or trojan (got: $WS_PROTOCOL)"; exit 1 ;;
+case "$SERVICE_MODE" in
+    standard|enhanced) ;;
+    *) log "SERVICE_MODE must be standard or enhanced (got: $SERVICE_MODE)"; exit 1 ;;
 esac
 
-if ! printf '%s' "$WS_PORT" | grep -Eq '^[0-9]+$' || [ "$WS_PORT" -lt 1 ] || [ "$WS_PORT" -gt 65535 ]; then
-    log "Invalid WS_PORT: $WS_PORT"
+if ! printf '%s' "$SERVICE_PORT" | grep -Eq '^[0-9]+$' || [ "$SERVICE_PORT" -lt 1 ] || [ "$SERVICE_PORT" -gt 65535 ]; then
+    log "Invalid SERVICE_PORT: $SERVICE_PORT"
     exit 1
 fi
 
-if [ "${WS_PATH#"/"}" = "$WS_PATH" ]; then
-    WS_PATH="/$WS_PATH"
+if [ "${SERVICE_ENDPOINT#"/"}" = "$SERVICE_ENDPOINT" ]; then
+    SERVICE_ENDPOINT="/$SERVICE_ENDPOINT"
 fi
 
 json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
 
-case "$WS_PROTOCOL" in
-    vless)
-        if [ -z "${VLESS_UUID:-}" ]; then
-            log "VLESS_UUID must be set when WS_PROTOCOL=vless"
+case "$SERVICE_MODE" in
+    standard)
+        if [ -z "${SERVICE_TOKEN:-}" ]; then
+            log "SERVICE_TOKEN must be set when SERVICE_MODE=standard"
             exit 1
         fi
-        CLIENT_JSON=$(printf '{"id":"%s"}' "$(json_escape "$VLESS_UUID")")
+        CLIENT_JSON=$(printf '{"id":"%s"}' "$(json_escape "$SERVICE_TOKEN")")
         SETTINGS_JSON=$(printf '"clients":[%s],"decryption":"none"' "$CLIENT_JSON")
         ;;
-    trojan)
-        if [ -z "${TROJAN_PASSWORD:-}" ]; then
-            log "TROJAN_PASSWORD must be set when WS_PROTOCOL=trojan"
+    enhanced)
+        if [ -z "${SERVICE_CREDENTIAL:-}" ]; then
+            log "SERVICE_CREDENTIAL must be set when SERVICE_MODE=enhanced"
             exit 1
         fi
-        CLIENT_JSON=$(printf '{"password":"%s"}' "$(json_escape "$TROJAN_PASSWORD")")
+        CLIENT_JSON=$(printf '{"password":"%s"}' "$(json_escape "$SERVICE_CREDENTIAL")")
         SETTINGS_JSON=$(printf '"clients":[%s]' "$CLIENT_JSON")
         ;;
 esac
 
-CONFIG_PATH="/tmp/xray-config.json"
+CONFIG_PATH="/tmp/service-config.json"
 umask 077
 
 cat > "$CONFIG_PATH" <<EOF
 {
   "log": {
-    "loglevel": "$(json_escape "$XRAY_LOG_LEVEL")"
+    "loglevel": "$(json_escape "$LOG_LEVEL")"
   },
   "inbounds": [
     {
-      "listen": "$(json_escape "$WS_HOST")",
-      "port": $WS_PORT,
-      "protocol": "$WS_PROTOCOL",
+      "listen": "$(json_escape "$SERVICE_HOST")",
+      "port": $SERVICE_PORT,
+      "protocol": "$SERVICE_MODE",
       "settings": {
         $SETTINGS_JSON
       },
       "streamSettings": {
         "network": "ws",
         "wsSettings": {
-          "path": "$(json_escape "$WS_PATH")"
+          "path": "$(json_escape "$SERVICE_ENDPOINT")"
         }
       }
     }
@@ -78,5 +78,5 @@ cat > "$CONFIG_PATH" <<EOF
 }
 EOF
 
-log "Starting Xray: ${WS_PROTOCOL} over WS on ${WS_HOST}:${WS_PORT} (path=${WS_PATH})"
-exec /usr/local/bin/xray -config "$CONFIG_PATH"
+log "Starting metrics agent: mode=${SERVICE_MODE} endpoint=${SERVICE_HOST}:${SERVICE_PORT}${SERVICE_ENDPOINT}"
+exec /usr/local/bin/cloud-metrics-agent -config "$CONFIG_PATH"

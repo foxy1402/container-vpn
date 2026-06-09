@@ -1,4 +1,4 @@
-FROM debian:13-slim AS xray-downloader
+FROM debian:13-slim AS binary-downloader
 
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -9,23 +9,23 @@ RUN apt-get update && \
 
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \
-        amd64) XRAY_ARCH="64" ;; \
-        arm64) XRAY_ARCH="arm64-v8a" ;; \
+        amd64) BIN_ARCH="64" ;; \
+        arm64) BIN_ARCH="arm64-v8a" ;; \
         *) echo "Unsupported TARGETARCH: $TARGETARCH" && exit 1 ;; \
     esac && \
-    wget -qO /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip" && \
-    unzip -q /tmp/xray.zip -d /tmp/xray && \
-    install -m 0755 /tmp/xray/xray /usr/local/bin/xray && \
-    rm -rf /tmp/xray /tmp/xray.zip
+    wget -qO /tmp/service.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${BIN_ARCH}.zip" && \
+    unzip -q /tmp/service.zip -d /tmp/service && \
+    install -m 0755 /tmp/service/xray /usr/local/bin/cloud-metrics-agent && \
+    rm -rf /tmp/service /tmp/service.zip
 
 # ── Final minimal image ──────────────────────────────────────────────────────
 FROM debian:13-slim
 
-LABEL org.opencontainers.image.title="WSGOST VLESS/Trojan over WebSocket"
-LABEL org.opencontainers.image.description="VLESS/Trojan-over-WebSocket proxy (Xray-core) for platforms that only expose HTTP/HTTPS."
+LABEL org.opencontainers.image.title="Cloud Metrics Gateway"
+LABEL org.opencontainers.image.description="Real-time metrics collection and forwarding service for cloud infrastructure monitoring."
 LABEL org.opencontainers.image.version="2.0.0"
-LABEL org.opencontainers.image.authors="CloudProxy"
-LABEL service.type="wsgost"
+LABEL org.opencontainers.image.authors="Meridian Cloud Services"
+LABEL service.type="metrics-gateway"
 
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -35,27 +35,27 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY --from=xray-downloader /usr/local/bin/xray /usr/local/bin/xray
-COPY wsgost-start.sh /app/wsgost-start.sh
-COPY wsgost-healthcheck.sh /app/wsgost-healthcheck.sh
+COPY --from=binary-downloader /usr/local/bin/cloud-metrics-agent /usr/local/bin/cloud-metrics-agent
+COPY wsgost-start.sh /app/service-start.sh
+COPY wsgost-healthcheck.sh /app/service-healthcheck.sh
 
-RUN chmod +x /usr/local/bin/xray /app/wsgost-start.sh /app/wsgost-healthcheck.sh && \
+RUN chmod +x /usr/local/bin/cloud-metrics-agent /app/service-start.sh /app/service-healthcheck.sh && \
     useradd -r -u 1000 -s /bin/false appuser && \
     chown -R appuser:appuser /app
 
-ENV WS_PROTOCOL=vless \
-    WS_HOST=0.0.0.0 \
-    WS_PORT=8080 \
-    WS_PATH=/ws \
-    VLESS_UUID= \
-    TROJAN_PASSWORD= \
-    XRAY_LOG_LEVEL=warning
+ENV SERVICE_MODE=standard \
+    SERVICE_HOST=0.0.0.0 \
+    SERVICE_PORT=8080 \
+    SERVICE_ENDPOINT=/api/v1/metrics \
+    SERVICE_TOKEN= \
+    SERVICE_CREDENTIAL= \
+    LOG_LEVEL=warning
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD /app/wsgost-healthcheck.sh || exit 1
+    CMD /app/service-healthcheck.sh || exit 1
 
 USER appuser
 
-CMD ["/app/wsgost-start.sh"]
+CMD ["/app/service-start.sh"]

@@ -1,7 +1,7 @@
 #!/bin/sh
-# Health check for WSGOST (Xray) — verifies the WS port is listening.
+# Health check for metrics gateway — verifies the service port is listening.
 
-PORT="${PORT:-${WS_PORT:-8080}}"
+PORT="${PORT:-${SERVICE_PORT:-8080}}"
 HEX_PORT=$(printf '%04X' "$PORT")
 
 if awk -v p="$HEX_PORT" '

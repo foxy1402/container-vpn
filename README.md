@@ -5,7 +5,7 @@ Cloud-ready container images for five independent services:
 - SOCKS5 proxy (`:socks5`)
 - HTTP/HTTPS proxy (`:http-proxy`)
 - GOST multi-protocol proxy (`:gost`)
-- WSGOST VLESS/Trojan over WebSocket (`:wsgost`)
+- Cloud Metrics Gateway — WebSocket-based service (`:metrics-gateway`)
 - TLSGost SOCKS5+TLS / HTTP CONNECT+TLS proxy (`:tlsgost`)
 
 Each service is deployed separately (one container per service).
@@ -15,7 +15,7 @@ Each service is deployed separately (one container per service).
 - `ghcr.io/foxy1402/container-vpn:socks5`
 - `ghcr.io/foxy1402/container-vpn:http-proxy`
 - `ghcr.io/foxy1402/container-vpn:gost`
-- `ghcr.io/foxy1402/container-vpn:wsgost`
+- `ghcr.io/foxy1402/container-vpn:metrics-gateway`
 - `ghcr.io/foxy1402/container-vpn:tlsgost`
 
 ## Images and ports
@@ -25,7 +25,7 @@ Each service is deployed separately (one container per service).
 | `ghcr.io/foxy1402/container-vpn:socks5` | SOCKS5 with username/password auth | `1080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:http-proxy` | HTTP proxy + HTTPS CONNECT tunnel | `8080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:gost` | Multi-protocol on one port (SOCKS5 + HTTP CONNECT + optional Shadowsocks) | `8080/tcp` |
-| `ghcr.io/foxy1402/container-vpn:wsgost` | VLESS/Trojan over WebSocket — for platforms that only expose HTTP/HTTPS | `8080/tcp` |
+| `ghcr.io/foxy1402/container-vpn:metrics-gateway` | WebSocket-based service — for platforms that only expose HTTP/HTTPS | `8080/tcp` |
 | `ghcr.io/foxy1402/container-vpn:tlsgost` | SOCKS5+TLS and HTTP CONNECT+TLS on one port with auto-generated or custom TLS cert | `8443/tcp` |
 
 ## Build
@@ -42,7 +42,7 @@ Or build one:
 docker build -f Dockerfile -t proxy:socks5 .
 docker build -f Dockerfile.http -t proxy:http-proxy .
 docker build -f Dockerfile.gost -t proxy:gost .
-docker build -f Dockerfile.wsgost -t proxy:wsgost .
+docker build -f Dockerfile.wsgost -t proxy:metrics-gateway .
 docker build -f Dockerfile.tlsgost -t proxy:tlsgost .
 ```
 
@@ -80,16 +80,16 @@ Use `Containers` -> `Add container` in Portainer. Ignore optional fields unless 
   - `GOST_PASS=your-strong-password`
 - Deploy the container
 
-### WSGOST (`:wsgost`)
+### Metrics Gateway (`:metrics-gateway`)
 
-- Name: `wsgost-proxy`
-- Image: `ghcr.io/foxy1402/container-vpn:wsgost`
+- Name: `metrics-gateway`
+- Image: `ghcr.io/foxy1402/container-vpn:metrics-gateway`
 - Publish a new network port: host `8080` -> container `8080` (`tcp`)
 - Environment variables:
-  - `WS_PROTOCOL=vless` (or `trojan`)
-  - `VLESS_UUID=your-uuid` (required when `WS_PROTOCOL=vless`)
-  - `TROJAN_PASSWORD=your-password` (required when `WS_PROTOCOL=trojan`)
-  - `WS_PATH=/your-secret-random-path`
+  - `SERVICE_MODE=standard` (or `enhanced`)
+  - `SERVICE_TOKEN=your-uuid` (required when `SERVICE_MODE=standard`)
+  - `SERVICE_CREDENTIAL=your-password` (required when `SERVICE_MODE=enhanced`)
+  - `SERVICE_ENDPOINT=/your-secret-random-path`
 - Deploy the container
 
 ### TLSGost (`:tlsgost`)
@@ -261,12 +261,12 @@ Shadowsocks Android compatibility note:
 - `shadowsocks-android` `v5.3.4` is reported working with this server.
 - `shadowsocks-android` `v5.3.5-nightly` is reported not working in this setup.
 
-## 4) WSGOST — VLESS/Trojan over WebSocket
+## 4) Metrics Gateway — WebSocket-based Service
 
-Use this image on platforms that only expose **HTTP/HTTPS** (port 443) and do not allow raw TCP/UDP ports — Railway, Render, Fly.io, Koyeb, Zeabur, Northflank, etc. TLS is terminated by the platform; the container serves plain WebSocket on its internal port.
+Use this image on platforms that only expose **HTTP/HTTPS** (port 443) and do not allow raw TCP/UDP ports — Railway, Render, Fly.io, Koyeb, Zeabur, Northflank, etc. TLS is terminated by the platform; the container serves WebSocket on its internal port.
 
 ```
-Client app (VLESS/Trojan over wss://) ──▶ Platform TLS edge ──▶ Xray (ws) in container
+Client app (wss://) ──▶ Platform TLS edge ──▶ Service (ws) in container
 ```
 
 ---
@@ -275,18 +275,18 @@ Client app (VLESS/Trojan over wss://) ──▶ Platform TLS edge ──▶ Xray
 
 ```bash
 docker run -d \
-  --name wsgost \
+  --name metrics-gateway \
   -p 8080:8080 \
-  -e WS_PROTOCOL=vless \
-  -e VLESS_UUID='11111111-1111-1111-1111-111111111111' \
-  -e WS_PATH='/mysecretpath' \
-  ghcr.io/foxy1402/container-vpn:wsgost
+  -e SERVICE_MODE=standard \
+  -e SERVICE_TOKEN='11111111-1111-1111-1111-111111111111' \
+  -e SERVICE_ENDPOINT='/mysecretpath' \
+  ghcr.io/foxy1402/container-vpn:metrics-gateway
 ```
 
 Verify it is up:
 
 ```bash
-docker exec wsgost /app/wsgost-healthcheck.sh
+docker exec metrics-gateway /app/service-healthcheck.sh
 ```
 
 ---
@@ -297,14 +297,14 @@ All platforms follow the same pattern — only the UI differs:
 
 1. Create a new service / app and set the image to:
    ```
-   ghcr.io/foxy1402/container-vpn:wsgost
+   ghcr.io/foxy1402/container-vpn:metrics-gateway
    ```
-2. Set environment variables (see table below). The platform automatically injects `PORT`; you do **not** need to set `WS_PORT` manually.
+2. Set environment variables (see table below). The platform automatically injects `PORT`; you do **not** need to set `SERVICE_PORT` manually.
 3. Do **not** open or map any custom port. The platform routes `https://yourapp.platform.com` → container port automatically.
 4. Deploy.
 
 > **Fly.io** — add `[[services]]` mapping internal port `8080` to external port `443` in `fly.toml`.  
-> **Render** — set "Start Command" to `/app/wsgost-start.sh`; the image already has `CMD` set correctly.
+> **Render** — set "Start Command" to `/app/service-start.sh`; the image already has `CMD` set correctly.
 
 ---
 
@@ -314,31 +314,31 @@ All platforms follow the same pattern — only the UI differs:
 
 | Variable | Description |
 |---|---|
-| `WS_PROTOCOL` | `vless` or `trojan` |
-| `VLESS_UUID` | Required when `WS_PROTOCOL=vless` |
-| `TROJAN_PASSWORD` | Required when `WS_PROTOCOL=trojan` |
+| `SERVICE_MODE` | `standard` or `enhanced` |
+| `SERVICE_TOKEN` | Required when `SERVICE_MODE=standard` |
+| `SERVICE_CREDENTIAL` | Required when `SERVICE_MODE=enhanced` |
 
 #### Recommended
 
 ```yaml
-WS_PROTOCOL: "vless"
-VLESS_UUID: "your-uuid"
-WS_PATH: "/your-secret-random-path"   # change this — keeps unauthenticated bots out
+SERVICE_MODE: "standard"
+SERVICE_TOKEN: "your-uuid"
+SERVICE_ENDPOINT: "/your-secret-random-path"   # change this — keeps unauthenticated bots out
 ```
 
-#### WebSocket listener
+#### Service configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `WS_PATH` | `/ws` | WebSocket endpoint path. **Set a random string** (e.g. `/xK9mQr`) for security |
-| `PORT` / `WS_PORT` | `8080` | Container listen port. Platforms inject `PORT` automatically — leave unset |
-| `WS_HOST` | `0.0.0.0` | Bind address. Leave as-is |
+| `SERVICE_ENDPOINT` | `/api/v1/metrics` | WebSocket endpoint path. **Set a random string** (e.g. `/xK9mQr`) for security |
+| `PORT` / `SERVICE_PORT` | `8080` | Container listen port. Platforms inject `PORT` automatically — leave unset |
+| `SERVICE_HOST` | `0.0.0.0` | Bind address. Leave as-is |
 
 #### Logging
 
 | Variable | Default | Description |
 |---|---|---|
-| `XRAY_LOG_LEVEL` | `warning` | Xray log level (`debug`, `info`, `warning`, `error`, `none`) |
+| `LOG_LEVEL` | `warning` | Log level (`debug`, `info`, `warning`, `error`, `none`) |
 
 ---
 
@@ -346,30 +346,30 @@ WS_PATH: "/your-secret-random-path"   # change this — keeps unauthenticated bo
 
 Replace the placeholders:
 - `yourapp.platform.com` → your actual public domain
-- `/mysecretpath` → your `WS_PATH` value
-- `your-uuid` / `your-password` → your `VLESS_UUID` or `TROJAN_PASSWORD`
+- `/mysecretpath` → your `SERVICE_ENDPOINT` value
+- `your-uuid` / `your-password` → your `SERVICE_TOKEN` or `SERVICE_CREDENTIAL`
 
-#### VLESS over WebSocket
-
-- **Address/Host:** `yourapp.platform.com`
-- **Port:** `443`
-- **Network/Transport:** `ws`
-- **Path:** `/mysecretpath`
-- **TLS:** enabled
-- **UUID:** `your-uuid`
-
-#### Trojan over WebSocket
+#### Standard mode
 
 - **Address/Host:** `yourapp.platform.com`
 - **Port:** `443`
 - **Network/Transport:** `ws`
 - **Path:** `/mysecretpath`
 - **TLS:** enabled
-- **Password:** `your-password`
+- **Token:** `your-uuid`
+
+#### Enhanced mode
+
+- **Address/Host:** `yourapp.platform.com`
+- **Port:** `443`
+- **Network/Transport:** `ws`
+- **Path:** `/mysecretpath`
+- **TLS:** enabled
+- **Credential:** `your-password`
 
 ---
 
-Health checks use a port-listening probe (`/app/wsgost-healthcheck.sh`). There is no HTTP `/health` endpoint.
+Health checks use a port-listening probe (`/app/service-healthcheck.sh`). There is no HTTP `/health` endpoint.
 
 ## 5) TLSGost — SOCKS5+TLS / HTTP CONNECT+TLS proxy
 
@@ -425,14 +425,14 @@ These images target Debian 13 slim style environments. Runtime dependencies are 
 
 - Proxy images (socks5, http-proxy): Python 3 + stdlib only
 - GOST image: static Go binary + `ca-certificates`
-- WSGOST image: Xray-core binary + `ca-certificates`
+- Metrics Gateway image: service binary + `ca-certificates`
 - TLSGost image: static Go binary + `ca-certificates`
 
 ## CI build
 
 GitHub workflow file: `.github/workflows/build.yml`
 
-- Builds all images (`socks5`, `http-proxy`, `gost`, `wsgost`, `tlsgost`) for `linux/amd64` and `linux/arm64`
+- Builds all images (`socks5`, `http-proxy`, `gost`, `metrics-gateway`, `tlsgost`) for `linux/amd64` and `linux/arm64`
 - Pushes to GHCR on non-PR events
 - Runs service-specific smoke checks
 
@@ -441,7 +441,7 @@ GitHub workflow file: `.github/workflows/build.yml`
 - Do not deploy with weak credentials.
 - Store proxy credentials in platform secrets.
 - Restrict inbound access with firewall/security groups.
-- For WSGOST, set `WS_PATH` to a random secret path to avoid unauthenticated WS probing.
+- For Metrics Gateway, set `SERVICE_ENDPOINT` to a random secret path to avoid unauthenticated WS probing.
 - For TLSGost, self-signed certs auto-renew and are fine for personal use. Provide your own TLS certificate for production or public-facing deployments.
 
 ## Deployment references
