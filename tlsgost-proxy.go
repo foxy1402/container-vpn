@@ -78,6 +78,9 @@ type Server struct {
 	config        *Config
 	listener      net.Listener
 	tlsConfig     *tls.Config
+	certPtr       atomic.Pointer[tls.Certificate]
+	certExpiry    time.Time
+	selfSigned    bool
 	activeConns   int64
 	connSemaphore chan struct{}
 	authFailures  map[string][]time.Time
@@ -118,6 +121,7 @@ func NewServer(config *Config) *Server {
 
 func (s *Server) buildTLSConfig() error {
 	var cert tls.Certificate
+	var expiry time.Time
 
 	if s.config.TLSCertFile != "" && s.config.TLSKeyFile != "" {
 		var err error
@@ -125,19 +129,30 @@ func (s *Server) buildTLSConfig() error {
 		if err != nil {
 			return fmt.Errorf("failed to load TLS cert/key: %w", err)
 		}
+		if len(cert.Certificate) > 0 {
+			if parsed, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+				expiry = parsed.NotAfter
+			}
+		}
 		log.Printf("Loaded TLS certificate from %s", s.config.TLSCertFile)
 	} else {
 		var err error
-		cert, err = generateSelfSignedCert()
+		cert, expiry, err = generateSelfSignedCert()
 		if err != nil {
 			return fmt.Errorf("failed to generate self-signed cert: %w", err)
 		}
+		s.selfSigned = true
 		log.Println("Generated self-signed TLS certificate (set TLSGOST_TLS_CERT/TLSGOST_TLS_KEY for production)")
 	}
 
+	s.certPtr.Store(&cert)
+	s.certExpiry = expiry
+
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   s.config.TLSMinVersion,
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return s.certPtr.Load(), nil
+		},
+		MinVersion: s.config.TLSMinVersion,
 	}
 
 	if s.config.SNI != "" {
@@ -153,40 +168,47 @@ func (s *Server) buildTLSConfig() error {
 	return nil
 }
 
-func generateSelfSignedCert() (tls.Certificate, error) {
+func generateSelfSignedCert() (tls.Certificate, time.Time, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
 
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
+
+	notAfter := time.Now().Add(365 * 24 * time.Hour)
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject:      pkix.Name{Organization: []string{"TLSGost Proxy"}},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
 
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	return tls.X509KeyPair(certPEM, keyPEM)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, time.Time{}, err
+	}
+
+	return cert, notAfter, nil
 }
 
 func (s *Server) Start() error {
@@ -221,6 +243,15 @@ func (s *Server) Start() error {
 		log.Printf("Certificate SHA-256: %s", fingerprint)
 	}
 
+	if !s.certExpiry.IsZero() {
+		log.Printf("Certificate expires: %s", s.certExpiry.Format("2006-01-02"))
+		if s.selfSigned {
+			log.Println("Auto-renewal enabled (will regenerate 30 days before expiry)")
+		}
+	}
+
+	s.startCertRenewal()
+
 	go s.handleSignals()
 
 	for s.running.Load() {
@@ -248,12 +279,50 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) certFingerprint() string {
-	if len(s.tlsConfig.Certificates) == 0 {
+	cert := s.certPtr.Load()
+	if cert == nil || len(cert.Certificate) == 0 {
 		return ""
 	}
-	leaf := s.tlsConfig.Certificates[0].Certificate[0]
-	hash := sha256.Sum256(leaf)
+	hash := sha256.Sum256(cert.Certificate[0])
 	return hex.EncodeToString(hash[:])
+}
+
+func (s *Server) startCertRenewal() {
+	if !s.selfSigned {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.shutdown:
+				return
+			case <-ticker.C:
+				remaining := time.Until(s.certExpiry)
+				if remaining < 30*24*time.Hour {
+					s.renewCert()
+				} else {
+					log.Printf("Certificate valid for %d more days", int(remaining.Hours()/24))
+				}
+			}
+		}
+	}()
+}
+
+func (s *Server) renewCert() {
+	cert, expiry, err := generateSelfSignedCert()
+	if err != nil {
+		log.Printf("Failed to renew self-signed certificate: %v", err)
+		return
+	}
+	s.certPtr.Store(&cert)
+	s.certExpiry = expiry
+	log.Printf("Renewed self-signed TLS certificate (expires %s)", expiry.Format("2006-01-02"))
+	log.Printf("New certificate SHA-256: %s", s.certFingerprint())
 }
 
 func (s *Server) handleSignals() {

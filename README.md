@@ -373,7 +373,7 @@ Health checks use a port-listening probe (`/app/wsgost-healthcheck.sh`). There i
 
 ## 5) TLSGost — SOCKS5+TLS / HTTP CONNECT+TLS proxy
 
-This image wraps SOCKS5 and HTTP CONNECT inside TLS on a single port. Clients connect over TLS and the proxy auto-detects whether the inner protocol is SOCKS5 or HTTP CONNECT. If no TLS certificate is provided, a self-signed ECDSA P-256 certificate is generated at startup.
+This image wraps SOCKS5 and HTTP CONNECT inside TLS on a single port. Clients connect over TLS and the proxy auto-detects whether the inner protocol is SOCKS5 or HTTP CONNECT. If no TLS certificate is provided, a self-signed ECDSA P-256 certificate is generated at startup and automatically renewed 30 days before expiry.
 
 ```
 Client (SOCKS5 or HTTP CONNECT over TLS) ──▶ TLSGost (TLS termination + auto-detect) ──▶ Internet
@@ -442,7 +442,7 @@ GitHub workflow file: `.github/workflows/build.yml`
 - Store proxy credentials in platform secrets.
 - Restrict inbound access with firewall/security groups.
 - For WSGOST, set `WS_PATH` to a random secret path to avoid unauthenticated WS probing.
-- For TLSGost, always provide your own TLS certificate in production. Self-signed certs are for testing only.
+- For TLSGost, self-signed certs auto-renew and are fine for personal use. Provide your own TLS certificate for production or public-facing deployments.
 
 ## Deployment references
 
