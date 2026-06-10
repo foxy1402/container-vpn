@@ -90,6 +90,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", indexHandler)
 	mux.HandleFunc(serviceEndpoint, makeHandler(serviceMode, authToken))
 	mux.HandleFunc("/health", healthHandler)
 	if resolverPath != "" {
@@ -117,6 +118,45 @@ func main() {
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprintln(w, "ok")
+}
+
+// ── Index page ────────────────────────────────────────────────────────────────
+
+const indexHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meridian Cloud Services</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e17;color:#c9d1d9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{text-align:center;padding:3rem 2rem;max-width:480px}
+.logo{font-size:2rem;font-weight:700;color:#58a6ff;margin-bottom:.5rem}
+.tagline{color:#8b949e;font-size:.95rem;margin-bottom:2.5rem}
+.status{display:inline-flex;align-items:center;gap:.5rem;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:.6rem 1.2rem;font-size:.85rem}
+.dot{width:8px;height:8px;border-radius:50%;background:#3fb950;display:inline-block}
+.footer{margin-top:2.5rem;font-size:.75rem;color:#484f58}
+</style>
+</head>
+<body>
+<div class="card">
+<div class="logo">Meridian Cloud Services</div>
+<p class="tagline">Infrastructure metrics collection &amp; forwarding platform</p>
+<div class="status"><span class="dot"></span> All systems operational</div>
+<p class="footer">&copy; 2024 Meridian Cloud Services. Internal use only.</p>
+</div>
+</body>
+</html>`
+
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Write([]byte(indexHTML)) //nolint:errcheck
 }
 
 // ── DNS resolver endpoint ─────────────────────────────────────────────────────
