@@ -102,13 +102,9 @@ services:
     ports:
       - "8082:8080"   # host:8082 → container:8080 (avoids conflict with gost-proxy above)
     environment:
-      - SERVICE_MODE=standard
       - SERVICE_TOKEN=your-uuid-here
       - SERVICE_PORT=8080
       - SERVICE_ENDPOINT=/api/v1/metrics
-      - LOG_LEVEL=warning
-      # For enhanced mode, set SERVICE_MODE=enhanced and add:
-      # - SERVICE_CREDENTIAL=your-password
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/app/service-healthcheck.sh"]

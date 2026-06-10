@@ -27,10 +27,10 @@
 - Five independent images/services: SOCKS5, HTTP/HTTPS proxy, GOST multi-protocol proxy, Metrics Gateway (VLESS/Trojan over WebSocket), and TLSGost (SOCKS5+TLS / HTTP CONNECT+TLS). Each runs as its own container with separate ports and env config.
 - `socks5_proxy.py` and `http_proxy.py` are Python stdlib proxies with env-based auth, connection limits, and self-healing bind retries.
 - `gost-proxy.go` is a Go 1.22 binary that auto-detects protocol per connection (SOCKS5, HTTP CONNECT, optional Shadowsocks).
-- `metrics-gateway.go` is a Go binary that accepts WebSocket connections and forwards them to the internal Xray-core processor.
-- Metrics Gateway runs Xray-core with a runtime-generated config (`metrics-gateway-start.sh`) and exposes a single WS listener for either VLESS or Trojan.
+- `metrics-gateway.go` is a Go binary that implements VLESS/Trojan protocols natively over WebSocket with built-in routing and authentication.
+- Metrics Gateway uses a lightweight native implementation (no external proxy engines) and exposes a single WS listener for either VLESS or Trojan.
 - `tlsgost-proxy.go` is a Go binary that wraps SOCKS5 and HTTP CONNECT inside TLS on a single port with auto-detection.
-- Dockerfiles run everything as a non-root user on slim Debian images; GOST/Metrics Gateway/TLSGost are static binaries (Go and Xray-core, respectively).
+- Dockerfiles run everything as a non-root user on slim Debian images; GOST/Metrics Gateway/TLSGost are static Go binaries.
 
 ## Key conventions
 - Configuration is entirely via environment variables, prefixed per service: `SOCKS5_*`, `HTTP_PROXY_*`, `GOST_*`, `SERVICE_*`, `TLSGOST_*`. Metrics Gateway requires `SERVICE_MODE` plus either `SERVICE_TOKEN` (standard/VLESS) or `SERVICE_CREDENTIAL` (enhanced/Trojan).

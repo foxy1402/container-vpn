@@ -1,29 +1,14 @@
-FROM debian:13-slim AS binary-downloader
-
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates \
-        wget \
-        unzip && \
-    rm -rf /var/lib/apt/lists/*
-
-ARG TARGETARCH
-RUN case "$TARGETARCH" in \
-        amd64) BIN_ARCH="64" ;; \
-        arm64) BIN_ARCH="arm64-v8a" ;; \
-        *) echo "Unsupported TARGETARCH: $TARGETARCH" && exit 1 ;; \
-    esac && \
-    wget -qO /tmp/service.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${BIN_ARCH}.zip" && \
-    unzip -q /tmp/service.zip -d /tmp/service && \
-    install -m 0755 /tmp/service/xray /usr/local/bin/cloud-metrics-agent && \
-    rm -rf /tmp/service /tmp/service.zip
+FROM golang:1.22-bookworm AS builder
+WORKDIR /build
+COPY metrics-gateway.go .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o metrics-gateway metrics-gateway.go
 
 # ── Final minimal image ──────────────────────────────────────────────────────
 FROM debian:13-slim
 
 LABEL org.opencontainers.image.title="Cloud Metrics Gateway"
 LABEL org.opencontainers.image.description="Real-time metrics collection and forwarding service for cloud infrastructure monitoring."
-LABEL org.opencontainers.image.version="2.0.0"
+LABEL org.opencontainers.image.version="3.0.0"
 LABEL org.opencontainers.image.authors="Meridian Cloud Services"
 LABEL service.type="metrics-gateway"
 
@@ -35,21 +20,18 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY --from=binary-downloader /usr/local/bin/cloud-metrics-agent /usr/local/bin/cloud-metrics-agent
+COPY --from=builder /build/metrics-gateway /usr/local/bin/metrics-gateway
 COPY metrics-gateway-start.sh /app/service-start.sh
 COPY metrics-gateway-healthcheck.sh /app/service-healthcheck.sh
 
-RUN chmod +x /usr/local/bin/cloud-metrics-agent /app/service-start.sh /app/service-healthcheck.sh && \
+RUN chmod +x /usr/local/bin/metrics-gateway /app/service-start.sh /app/service-healthcheck.sh && \
     useradd -r -u 1000 -s /bin/false appuser && \
     chown -R appuser:appuser /app
 
-ENV SERVICE_MODE=standard \
-    SERVICE_HOST=0.0.0.0 \
+ENV SERVICE_HOST=0.0.0.0 \
     SERVICE_PORT=8080 \
     SERVICE_ENDPOINT=/api/v1/metrics \
-    SERVICE_TOKEN= \
-    SERVICE_CREDENTIAL= \
-    LOG_LEVEL=warning
+    SERVICE_TOKEN=
 
 EXPOSE 8080
 

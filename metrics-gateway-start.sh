@@ -1,5 +1,5 @@
 #!/bin/sh
-# service-start.sh — generate service configuration and start the metrics agent.
+# service-start.sh — validate configuration and start the metrics agent.
 
 set -eu
 
@@ -9,12 +9,24 @@ SERVICE_HOST="${SERVICE_HOST:-0.0.0.0}"
 SERVICE_PORT="${PORT:-${SERVICE_PORT:-8080}}"
 SERVICE_ENDPOINT="${SERVICE_ENDPOINT:-/api/v1/metrics}"
 SERVICE_MODE="${SERVICE_MODE:-standard}"
-LOG_LEVEL="${LOG_LEVEL:-warning}"
 
 case "$SERVICE_MODE" in
     standard|enhanced) ;;
-    *) log "SERVICE_MODE must be standard or enhanced (got: $SERVICE_MODE)"; exit 1 ;;
+    *)
+        log "SERVICE_MODE must be standard or enhanced (got: $SERVICE_MODE)"
+        exit 1
+        ;;
 esac
+
+if [ "$SERVICE_MODE" = "standard" ] && [ -z "${SERVICE_TOKEN:-}" ]; then
+    log "SERVICE_TOKEN is required"
+    exit 1
+fi
+
+if [ "$SERVICE_MODE" = "enhanced" ] && [ -z "${SERVICE_CREDENTIAL:-}" ]; then
+    log "SERVICE_CREDENTIAL is required for enhanced mode"
+    exit 1
+fi
 
 if ! printf '%s' "$SERVICE_PORT" | grep -Eq '^[0-9]+$' || [ "$SERVICE_PORT" -lt 1 ] || [ "$SERVICE_PORT" -gt 65535 ]; then
     log "Invalid SERVICE_PORT: $SERVICE_PORT"
@@ -23,63 +35,8 @@ fi
 
 if [ "${SERVICE_ENDPOINT#"/"}" = "$SERVICE_ENDPOINT" ]; then
     SERVICE_ENDPOINT="/$SERVICE_ENDPOINT"
+    export SERVICE_ENDPOINT
 fi
 
-json_escape() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
-}
-
-# Map obfuscated mode names to actual Xray protocol names
-case "$SERVICE_MODE" in
-    standard)
-        XRAY_PROTOCOL="vless"
-        if [ -z "${SERVICE_TOKEN:-}" ]; then
-            log "SERVICE_TOKEN must be set when SERVICE_MODE=standard"
-            exit 1
-        fi
-        CLIENT_JSON=$(printf '{"id":"%s"}' "$(json_escape "$SERVICE_TOKEN")")
-        SETTINGS_JSON=$(printf '"clients":[%s],"decryption":"none"' "$CLIENT_JSON")
-        ;;
-    enhanced)
-        XRAY_PROTOCOL="trojan"
-        if [ -z "${SERVICE_CREDENTIAL:-}" ]; then
-            log "SERVICE_CREDENTIAL must be set when SERVICE_MODE=enhanced"
-            exit 1
-        fi
-        CLIENT_JSON=$(printf '{"password":"%s"}' "$(json_escape "$SERVICE_CREDENTIAL")")
-        SETTINGS_JSON=$(printf '"clients":[%s]' "$CLIENT_JSON")
-        ;;
-esac
-
-CONFIG_PATH="/tmp/service-config.json"
-umask 077
-
-cat > "$CONFIG_PATH" <<EOF
-{
-  "log": {
-    "loglevel": "$(json_escape "$LOG_LEVEL")"
-  },
-  "inbounds": [
-    {
-      "listen": "$(json_escape "$SERVICE_HOST")",
-      "port": $SERVICE_PORT,
-      "protocol": "$XRAY_PROTOCOL",
-      "settings": {
-        $SETTINGS_JSON
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "$(json_escape "$SERVICE_ENDPOINT")"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom" }
-  ]
-}
-EOF
-
-log "Starting metrics agent: mode=${SERVICE_MODE} endpoint=${SERVICE_HOST}:${SERVICE_PORT}${SERVICE_ENDPOINT}"
-exec /usr/local/bin/cloud-metrics-agent -config "$CONFIG_PATH"
+log "Starting metrics agent: endpoint=${SERVICE_HOST}:${SERVICE_PORT}${SERVICE_ENDPOINT}"
+exec /usr/local/bin/metrics-gateway
