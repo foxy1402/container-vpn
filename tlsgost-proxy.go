@@ -137,7 +137,7 @@ func (s *Server) buildTLSConfig() error {
 		log.Printf("Loaded TLS certificate from %s", s.config.TLSCertFile)
 	} else {
 		var err error
-		cert, expiry, err = generateSelfSignedCert()
+		cert, expiry, err = generateSelfSignedCert(s.config.SNI)
 		if err != nil {
 			return fmt.Errorf("failed to generate self-signed cert: %w", err)
 		}
@@ -153,6 +153,7 @@ func (s *Server) buildTLSConfig() error {
 			return s.certPtr.Load(), nil
 		},
 		MinVersion: s.config.TLSMinVersion,
+		NextProtos: []string{"h2", "http/1.1"},
 	}
 
 	if s.config.SNI != "" {
@@ -168,7 +169,11 @@ func (s *Server) buildTLSConfig() error {
 	return nil
 }
 
-func generateSelfSignedCert() (tls.Certificate, time.Time, error) {
+func generateSelfSignedCert(domain string) (tls.Certificate, time.Time, error) {
+	if domain == "" {
+		domain = "example.com"
+	}
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, time.Time{}, err
@@ -183,11 +188,12 @@ func generateSelfSignedCert() (tls.Certificate, time.Time, error) {
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
-		Subject:      pkix.Name{Organization: []string{"TLSGost Proxy"}},
+		Subject:      pkix.Name{},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{domain},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
@@ -314,7 +320,7 @@ func (s *Server) startCertRenewal() {
 }
 
 func (s *Server) renewCert() {
-	cert, expiry, err := generateSelfSignedCert()
+	cert, expiry, err := generateSelfSignedCert(s.config.SNI)
 	if err != nil {
 		log.Printf("Failed to renew self-signed certificate: %v", err)
 		return
@@ -966,10 +972,10 @@ func getEnvBool(name string, defaultVal bool) bool {
 
 func parseTLSMinVersion(v string) uint16 {
 	switch strings.TrimSpace(strings.ToLower(v)) {
-	case "1.3", "tls13", "tls1.3":
-		return tls.VersionTLS13
-	default:
+	case "1.2", "tls12", "tls1.2":
 		return tls.VersionTLS12
+	default:
+		return tls.VersionTLS13
 	}
 }
 
