@@ -36,7 +36,11 @@ Build all images:
 ./build-all.sh
 ```
 
-Or build one:
+Or build one service script (gost / tlsgost): `./build-gost.sh` / `./build-tlsgost.sh`. These scripts build with `--pull`, tag both `VERSION` (git describe, overridable via `VERSION=x.y.z ./build-gost.sh`) and `latest`, record the base-image digests in the build log, and verify the image by actually executing the binary (`-version`) instead of just listing files.
+
+Base images are pinned by digest (`golang:1.25-alpine@sha256:…`, `debian:13-slim@sha256:…`); update the digests deliberately and rebuild regularly for base CVE fixes.
+
+Or build by hand:
 
 ```bash
 docker build -f Dockerfile -t proxy:socks5 .
@@ -195,6 +199,8 @@ This image supports SOCKS5 + HTTP CONNECT on one port, and optional Shadowsocks 
 
 Authentication/credentials are configured via environment variables.
 
+**Security note:** this listener has no on-wire encryption — SOCKS5 and HTTP Basic credentials are sent in cleartext between client and container. Put it behind a TLS terminator, restrict it to localhost/private networks, or use the `:tlsgost` image instead, which wraps the same protocols in TLS.
+
 Required env:
 
 - `GOST_USER`
@@ -215,9 +221,10 @@ Optional env:
 - `GOST_HOST` (default `0.0.0.0`)
 - `GOST_PORT` (default `8080`)
 - `GOST_SS_KEY` (optional, enables Shadowsocks when set; this is your Shadowsocks password)
-- `GOST_SS_CIPHER` (default `aes-256-gcm`)
+- `GOST_SS_CIPHER` (default `aes-256-gcm`; supported: `aes-256-gcm`, `aes-128-gcm` — validated at startup, container refuses to boot on unsupported values)
 - `GOST_MAX_CONN` (default `200`)
 - `GOST_HANDSHAKE_TIMEOUT` (default `30`, recommended `45` for mobile app compatibility)
+- `GOST_SNIFF_TIMEOUT` (default `10`; budget for pre-auth protocol detection per connection — unauthenticated slow-drip clients are cut after this)
 - `GOST_TIMEOUT` (default `15`)
 - `GOST_IDLE_TIMEOUT` (default `300`)
 - `GOST_AUTH_FAIL_LIMIT` (default `5`)
@@ -245,7 +252,15 @@ curl -x socks5h://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
 
 # HTTP CONNECT
 curl -x http://myuser:strong-password@127.0.0.1:8080 https://ifconfig.me
+
+# Container health (runs inside the container; end-to-end probe of
+# listener + auth + egress policy, exit 0 = healthy)
+docker exec gost-proxy /app/gost-proxy-healthcheck.sh
 ```
+
+Built-in binary flags: `-version` (print version and exit), `-healthcheck` (probe the local listener and exit 0/1).
+
+Egress policy (all protocols — SOCKS5, HTTP CONNECT, Shadowsocks): the proxy refuses connections to loopback, private (RFC 1918/ULA), link-local (incl. `169.254.169.254` cloud metadata), unspecified (`0.0.0.0`/`::`), multicast, and CGNAT (`100.64.0.0/10`) destinations, and to ports 22, 23, 25, 3306, 5432, 6379, 27017. Hostnames are resolved once, validated, and dialed by IP, so DNS-rebinding cannot bypass the filter. Shadowsocks handshakes are additionally protected by a bounded replay-salt cache.
 
 Mobile app note:
 
@@ -523,7 +538,9 @@ Most client apps (v2rayNG, Shadowrocket, v2raytun) can import these directly via
 
 ## 5) TLSGost — SOCKS5+TLS / HTTP CONNECT+TLS proxy
 
-This image wraps SOCKS5 and HTTP CONNECT inside TLS on a single port. Clients connect over TLS and the proxy auto-detects whether the inner protocol is SOCKS5 or HTTP CONNECT. If no TLS certificate is provided, a self-signed ECDSA P-256 certificate is generated at startup and automatically renewed 30 days before expiry.
+This image wraps SOCKS5 and HTTP CONNECT inside TLS on a single port. Clients connect over TLS and the proxy auto-detects whether the inner protocol is SOCKS5 or HTTP CONNECT. If no TLS certificate is provided, a self-signed ECDSA P-256 certificate is generated at startup and automatically renewed 30 days before expiry. **Note:** self-signed renewal rotates the private key, so the certificate's SHA-256 fingerprint changes on each rotation — if your clients pin the fingerprint, either provide your own cert or expect to update pins roughly yearly.
+
+Mounted certificates (`TLSGOST_TLS_CERT`/`TLSGOST_TLS_KEY`) are hot-reloaded automatically when the files change (checked hourly) — certbot or Kubernetes secret rotations take effect without a container restart. Keys are generated in memory and never written to the image.
 
 ```
 Client (SOCKS5 or HTTP CONNECT over TLS) ──▶ TLSGost (TLS termination + auto-detect) ──▶ Internet
@@ -548,10 +565,12 @@ Optional env:
 - `TLSGOST_PORT` (default `8443`)
 - `TLSGOST_TLS_CERT` (optional, path to PEM certificate file; auto-generates self-signed if empty)
 - `TLSGOST_TLS_KEY` (optional, path to PEM private key file; required with `TLSGOST_TLS_CERT`)
-- `TLSGOST_TLS_MIN_VERSION` (default `1.2`, set to `1.3` to require TLS 1.3)
+- `TLSGOST_TLS_MIN_VERSION` (default `1.3`; only lower to `1.2` for legacy clients — a warning is logged and cipher suites are then restricted to AEAD-only)
 - `TLSGOST_SNI` (optional, rejects TLS connections where client SNI does not match this value)
+- `TLSGOST_CERT_IPS` (optional, comma-separated IPs added as IP SANs to the self-signed certificate — needed when clients connect by raw IP and verify the cert)
 - `TLSGOST_MAX_CONN` (default `200`)
 - `TLSGOST_HANDSHAKE_TIMEOUT` (default `30`)
+- `TLSGOST_SNIFF_TIMEOUT` (default `10`; post-handshake pre-auth protocol detection budget — limits unauthenticated slow-drip slot exhaustion)
 - `TLSGOST_TIMEOUT` (default `15`)
 - `TLSGOST_IDLE_TIMEOUT` (default `300`)
 - `TLSGOST_AUTH_FAIL_LIMIT` (default `5`)
@@ -559,11 +578,46 @@ Optional env:
 - `TLSGOST_ALLOW_NOAUTH` (default `false`)
 - `TLSGOST_FORCE_IPV4` (default `true`, recommended for IPv4-only cloud egress)
 
+Run:
+
+```bash
+docker run -d \
+  --name tlsgost-proxy \
+  -p 8443:8443 \
+  -e TLSGOST_USER=myuser \
+  -e TLSGOST_PASS='strong-password' \
+  ghcr.io/foxy1402/container-vpn:tlsgost
+```
+
+Test:
+
+```bash
+# Self-signed cert -> --proxy-insecure skips proxy cert verification
+curl --proxy-insecure -x https://myuser:strong-password@127.0.0.1:8443 https://ifconfig.me
+
+# Container health (full TLS handshake + auth + egress-policy probe, exit 0 = healthy)
+docker exec tlsgost-proxy /app/tlsgost-healthcheck.sh
+```
+
+Built-in binary flags: `-version`, `-healthcheck` (same semantics as the GOST image).
+
+Egress policy: identical to the GOST image (see above) — loopback/private/link-local/unspecified/multicast/CGNAT and the blocked port list are enforced on both SOCKS5+TLS and HTTP CONNECT+TLS, with resolve-once-dial-IP validation against DNS rebinding.
+
 
 
 ## docker compose
 
-Local test for SOCKS5 + HTTP:
+The hardened `docker-compose-gost.yml` requires credentials via a `.env` file — there are no default/committed passwords, and deployment fails fast if a variable is missing:
+
+```bash
+cp .env.example .env
+# edit .env — fill in strong random values (e.g. openssl rand -base64 24)
+docker compose -f docker-compose-gost.yml --env-file .env up -d gost-proxy
+```
+
+All published ports in that file bind to `127.0.0.1` by default (edit the `ports:` entries to expose externally), and the proxy services run with `cap_drop: ALL`, `no-new-privileges`, and (for gost) `read_only` + `pids_limit`. `.env` is git-ignored — never commit real credentials.
+
+Quick local test for SOCKS5 + HTTP (default `docker-compose.yml`):
 
 ```bash
 docker compose up -d socks5 http-proxy
@@ -574,9 +628,11 @@ docker compose up -d socks5 http-proxy
 These images target Debian 13 slim style environments. Runtime dependencies are kept small:
 
 - Proxy images (socks5, http-proxy): Python 3 + stdlib only
-- GOST image: static Go binary + `ca-certificates`
+- GOST image: static Go 1.25 binary + `ca-certificates` — zero external Go modules
 - Metrics Gateway image: static Go binary + `ca-certificates` (native implementation, no external proxy engines)
-- TLSGost image: static Go binary + `ca-certificates`
+- TLSGost image: static Go 1.25 binary + `ca-certificates` — zero external Go modules
+
+All Go images run as a non-root user and are built from digest-pinned base images.
 
 ## CI build
 
@@ -589,13 +645,9 @@ GitHub workflow file: `.github/workflows/build.yml`
 ## Security notes
 
 - Do not deploy with weak credentials.
-- Store proxy credentials in platform secrets.
-- Restrict inbound access with firewall/security groups.
+- Store proxy credentials in platform secrets — env vars are visible via `docker inspect` and `/proc/<pid>/environ`, so prefer Docker secrets/mounted files for sensitive deployments.
+- Restrict inbound access with firewall/security groups; bind ports to `127.0.0.1` where external access is not needed (the compose file does this by default).
+- GOST (`:gost`) sends SOCKS5/Basic credentials without on-wire encryption — put it behind TLS or use `:tlsgost` for encryption in transit.
+- All proxy egress is filtered: internal address ranges and SMTP/database ports are blocked on every protocol, with DNS-rebinding-resistant resolution. Do not disable this by forking unless you understand the consequences.
 - For Metrics Gateway, set `SERVICE_ENDPOINT` to a random secret path to avoid unauthenticated WS probing.
-- For TLSGost, self-signed certs auto-renew and are fine for personal use. Provide your own TLS certificate for production or public-facing deployments.
-
-## Deployment references
-
-- Quick start: `START-HERE.md`
-- Claw deployment details: `CLAW-DEPLOYMENT.md`
-
+- For TLSGost, self-signed certs auto-renew and are fine for personal use (note: rotation changes the cert fingerprint — see the TLSGost section). Provide your own TLS certificate for production or public-facing deployments; mounted certs are hot-reloaded on change.

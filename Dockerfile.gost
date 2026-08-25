@@ -1,4 +1,5 @@
-FROM golang:1.22-alpine AS builder
+# Pinned by digest for reproducible builds (update deliberately, rebuild on CVEs)
+FROM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates
@@ -10,7 +11,7 @@ WORKDIR /build
 ARG TARGETOS
 ARG TARGETARCH
 
-# Copy module files first for better layer caching
+# Copy module files first for better layer caching (module has no external deps)
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -24,12 +25,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     -o gost-proxy gost-proxy.go
 
 # Final minimal image
-FROM debian:13-slim
+FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
 # Metadata
 LABEL org.opencontainers.image.title="GOST Multi-Protocol Proxy"
 LABEL org.opencontainers.image.description="Production-ready SOCKS5/HTTP/Shadowsocks proxy with auto protocol detection"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="1.1.0"
 LABEL org.opencontainers.image.authors="CloudProxy"
 LABEL service.type="gost-multi"
 
@@ -52,6 +53,8 @@ RUN useradd -r -u 1000 -s /bin/false appuser && \
     chown -R appuser:appuser /app
 
 # Environment variables
+# NOTE: GOST_USER/GOST_PASS travel as env vars - visible via `docker inspect`
+# and /proc/<pid>/environ. Prefer Docker secrets for sensitive deployments.
 ENV GOST_HOST=0.0.0.0 \
     GOST_PORT=8080 \
     GOST_USER= \
@@ -59,6 +62,8 @@ ENV GOST_HOST=0.0.0.0 \
     GOST_SS_KEY= \
     GOST_SS_CIPHER=aes-256-gcm \
     GOST_MAX_CONN=200 \
+    GOST_HANDSHAKE_TIMEOUT=30 \
+    GOST_SNIFF_TIMEOUT=10 \
     GOST_TIMEOUT=15 \
     GOST_IDLE_TIMEOUT=300 \
     GOST_AUTH_FAIL_LIMIT=5 \
@@ -66,14 +71,14 @@ ENV GOST_HOST=0.0.0.0 \
     GOST_ALLOW_NOAUTH=false \
     GOST_FORCE_IPV4=true
 
-# Expose port
-EXPOSE 8080
+# Expose port (follows GOST_PORT above)
+EXPOSE ${GOST_PORT}
 
 # Copy health check script
 COPY gost-proxy-healthcheck.sh /app/gost-proxy-healthcheck.sh
 RUN chmod +x /app/gost-proxy-healthcheck.sh
 
-# Health check - test SOCKS5 protocol detection
+# Health check - end-to-end probe of listener, auth, and egress policy
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD /app/gost-proxy-healthcheck.sh || exit 1
 

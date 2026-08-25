@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
@@ -11,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -24,8 +27,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"golang.org/x/crypto/hkdf"
 )
 
 const (
@@ -59,7 +60,40 @@ const (
 	// Buffer sizes
 	BufferSize     = 32 * 1024
 	PeekBufferSize = 16
+
+	// appVersion is reported by -version.
+	appVersion = "1.1.0"
+
+	// maxHTTPHeaderBytes caps the request line + header block a client may
+	// send before the connection is dropped (memory-DoS guard).
+	maxHTTPHeaderBytes = 8 * 1024
+
+	// maxAuthFailureEntries bounds the per-IP auth failure map.
+	maxAuthFailureEntries = 10000
+
+	// replayCacheSize bounds the Shadowsocks replay filter; replayWindow is
+	// how long a used salt is remembered (salt reuse is only attempted by
+	// replaying attackers — legitimate clients generate fresh ones).
+	replayCacheSize = 100000
+	replayWindow    = 24 * time.Hour
 )
+
+// errBlockedTarget marks egress-policy rejections in resolveTarget errors.
+var errBlockedTarget = errors.New("target blocked by egress policy")
+
+// cgnatPrefix is the shared CGNAT space (RFC 6598), treated as internal.
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// blockedTargetPorts are egress ports never proxied to, on every protocol.
+var blockedTargetPorts = map[int]bool{
+	22:    true, // SSH
+	23:    true, // Telnet
+	25:    true, // SMTP (outbound spam relay)
+	3306:  true, // MySQL
+	5432:  true, // PostgreSQL
+	6379:  true, // Redis
+	27017: true, // MongoDB
+}
 
 // Config holds server configuration
 type Config struct {
@@ -71,6 +105,7 @@ type Config struct {
 	ShadowsocksCipher string
 	MaxConnections    int
 	HandshakeTimeout  time.Duration
+	SniffTimeout      time.Duration
 	ConnectionTimeout time.Duration
 	IdleTimeout       time.Duration
 	AuthFailLimit     int
@@ -87,7 +122,7 @@ type Server struct {
 	connSemaphore chan struct{}
 	authFailures  map[string][]time.Time
 	authMutex     sync.RWMutex
-	shutdown      chan struct{}
+	replay        *replayCache
 	wg            sync.WaitGroup
 	running       atomic.Bool
 }
@@ -113,13 +148,22 @@ func (w *ConnectionWrapper) Peek(n int) ([]byte, error) {
 	return w.reader.Peek(n)
 }
 
+// CloseWrite half-closes the underlying connection when it supports it, so a
+// finished direction of a relay can signal EOF without killing the other.
+func (w *ConnectionWrapper) CloseWrite() error {
+	if cw, ok := w.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return w.Conn.Close()
+}
+
 // NewServer creates a new multi-protocol proxy server
 func NewServer(config *Config) *Server {
 	return &Server{
 		config:        config,
 		connSemaphore: make(chan struct{}, config.MaxConnections),
 		authFailures:  make(map[string][]time.Time),
-		shutdown:      make(chan struct{}),
+		replay:        newReplayCache(replayCacheSize),
 	}
 }
 
@@ -146,19 +190,32 @@ func (s *Server) Start() error {
 	}
 	log.Printf("Protocols: %s", protocols)
 
+	// Warn once about plaintext credentials on the wire
+	log.Println("NOTE: SOCKS5/HTTP auth credentials are sent without encryption; use the tlsgost image or a TLS terminator in front of this proxy")
+
 	// Handle graceful shutdown
 	go s.handleSignals()
 
 	// Accept loop
+	acceptFails := 0
 	for s.running.Load() {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if s.running.Load() {
+				acceptFails++
 				log.Printf("Accept error: %v", err)
+				// Back off so a persistent accept failure (e.g. fd
+				// exhaustion) does not spin CPU and flood the log.
+				backoff := time.Duration(acceptFails) * 10 * time.Millisecond
+				if backoff > time.Second {
+					backoff = time.Second
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			break
 		}
+		acceptFails = 0
 
 		// Apply connection limit
 		select {
@@ -184,7 +241,6 @@ func (s *Server) handleSignals() {
 	log.Printf("Received signal %v, initiating graceful shutdown", sig)
 
 	s.running.Store(false)
-	close(s.shutdown)
 
 	if s.listener != nil {
 		s.listener.Close()
@@ -217,8 +273,10 @@ func (s *Server) handleConnection(rawConn net.Conn) {
 		s.wg.Done()
 	}()
 
-	// Set read deadline for protocol detection
-	rawConn.SetReadDeadline(time.Now().Add(s.config.HandshakeTimeout))
+	// Set read deadline for protocol detection. This runs before any
+	// authentication, so it uses the shorter sniff timeout to limit how long
+	// an unauthenticated client can hold a connection slot with a slow drip.
+	rawConn.SetReadDeadline(time.Now().Add(s.config.SniffTimeout))
 
 	// Wrap connection for peeking
 	conn := NewConnectionWrapper(rawConn)
@@ -231,7 +289,7 @@ func (s *Server) handleConnection(rawConn net.Conn) {
 			return
 		}
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			log.Printf("Protocol detection timeout from %s after %s", conn.RemoteAddr(), s.config.HandshakeTimeout)
+			log.Printf("Protocol detection timeout from %s after %s", conn.RemoteAddr(), s.config.SniffTimeout)
 			return
 		}
 		log.Printf("Protocol detection failed from %s: %v", conn.RemoteAddr(), err)
@@ -298,13 +356,18 @@ func (s *Server) checkRateLimit(ip string) bool {
 	now := time.Now()
 	cutoff := now.Add(-s.config.AuthFailWindow)
 
-	// Clean old entries
+	// Clean old entries; delete the key entirely once empty so the map
+	// cannot grow forever under rotating/spoofed source IPs.
 	failures := s.authFailures[ip]
 	validFailures := make([]time.Time, 0)
 	for _, t := range failures {
 		if t.After(cutoff) {
 			validFailures = append(validFailures, t)
 		}
+	}
+	if len(validFailures) == 0 {
+		delete(s.authFailures, ip)
+		return true
 	}
 	s.authFailures[ip] = validFailures
 
@@ -320,12 +383,109 @@ func (s *Server) recordAuthFailure(ip string) {
 	s.authMutex.Lock()
 	defer s.authMutex.Unlock()
 
+	// Bound total tracked IPs; evict an arbitrary entry when full rather
+	// than letting the map grow without limit.
+	if _, ok := s.authFailures[ip]; !ok && len(s.authFailures) >= maxAuthFailureEntries {
+		for k := range s.authFailures {
+			delete(s.authFailures, k)
+			break
+		}
+	}
+
 	s.authFailures[ip] = append(s.authFailures[ip], time.Now())
+}
+
+// extractIP returns the host part of a remote address, handling IPv6.
+func extractIP(addr net.Addr) string {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
+// sanitizeLog strips control characters from client-supplied strings so a
+// malicious target host cannot forge log lines (newline injection).
+func sanitizeLog(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// errHeaderTooLarge is returned when the HTTP header block exceeds the cap.
+var errHeaderTooLarge = errors.New("header section too large")
+
+// readHTTPLine reads one CRLF/LF-terminated line directly from the wrapper's
+// buffered reader, enforcing a shared byte budget across the whole header
+// block. Byte-by-byte reads on the buffered reader are cheap and guarantee no
+// pipelined tunnel bytes are swallowed into a second buffer.
+func readHTTPLine(r *bufio.Reader, budget *int) (string, error) {
+	var sb strings.Builder
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		*budget--
+		if *budget < 0 {
+			return "", errHeaderTooLarge
+		}
+		sb.WriteByte(b)
+		if b == '\n' {
+			return sb.String(), nil
+		}
+	}
+}
+
+// replayCache is a bounded seen-salt filter rejecting replayed Shadowsocks
+// handshakes.
+type replayCache struct {
+	mu    sync.Mutex
+	salts map[[32]byte]time.Time
+	max   int
+}
+
+func newReplayCache(max int) *replayCache {
+	return &replayCache{salts: make(map[[32]byte]time.Time), max: max}
+}
+
+// checkOrAdd returns false if the salt was seen before (replay).
+func (r *replayCache) checkOrAdd(salt []byte) bool {
+	var key [32]byte
+	copy(key[:], salt)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.salts) >= r.max {
+		now := time.Now()
+		for k, t := range r.salts {
+			if now.Sub(t) > replayWindow {
+				delete(r.salts, k)
+			}
+		}
+		// Still full: evict an arbitrary entry to stay bounded.
+		if len(r.salts) >= r.max {
+			for k := range r.salts {
+				delete(r.salts, k)
+				break
+			}
+		}
+	}
+
+	if _, seen := r.salts[key]; seen {
+		return false
+	}
+	r.salts[key] = time.Now()
+	return true
 }
 
 // handleSOCKS5 handles SOCKS5 protocol
 func (s *Server) handleSOCKS5(conn *ConnectionWrapper) {
-	clientIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+	clientIP := extractIP(conn.RemoteAddr())
 
 	// Read greeting: version and methods
 	greeting := make([]byte, 2)
@@ -442,23 +602,33 @@ func (s *Server) handleSOCKS5(conn *ConnectionWrapper) {
 	}
 	port := binary.BigEndian.Uint16(portBuf)
 
-	// Connect to target
+	// Connect to target. The egress port policy applies to every protocol
+	// (HTTP CONNECT included) so the proxy cannot be abused e.g. for SMTP
+	// spam relay over SOCKS5.
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
-	var remote net.Conn
-	if !s.isSafeTarget(host) {
-		log.Printf("Blocked unsafe SOCKS5 target from %s to %s", clientIP, target)
+	if blockedTargetPorts[int(port)] {
+		log.Printf("Blocked SOCKS5 egress port %d from %s to %s", port, clientIP, sanitizeLog(target))
 		s.sendSOCKS5Reply(conn, SOCKS5RepNotAllowed)
 		return
 	}
 
-	if s.config.ForceIPv4 {
-		remote, err = s.dialIPv4(target, s.config.ConnectionTimeout)
-	} else {
-		remote, err = net.DialTimeout("tcp", target, s.config.ConnectionTimeout)
+	// Resolve and validate once, then dial the validated IP literally —
+	// re-resolving here would open a DNS-rebinding TOCTOU window.
+	addrs, err := s.resolveTarget(host)
+	if err != nil {
+		if errors.Is(err, errBlockedTarget) {
+			log.Printf("Blocked unsafe SOCKS5 target from %s to %s", clientIP, sanitizeLog(target))
+			s.sendSOCKS5Reply(conn, SOCKS5RepNotAllowed)
+		} else {
+			log.Printf("Failed to resolve SOCKS5 target %s from %s: %v", sanitizeLog(host), clientIP, err)
+			s.sendSOCKS5Reply(conn, SOCKS5RepHostUnreachable)
+		}
+		return
 	}
 
+	remote, err := s.dialTarget(addrs, int(port))
 	if err != nil {
-		log.Printf("Failed to connect to %s: %v", target, err)
+		log.Printf("Failed to connect to %s: %v", sanitizeLog(target), err)
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			s.sendSOCKS5Reply(conn, SOCKS5RepTTLExpired)
 		} else {
@@ -469,13 +639,16 @@ func (s *Server) handleSOCKS5(conn *ConnectionWrapper) {
 	defer remote.Close()
 
 	// Send success reply
-	bindAddr := remote.LocalAddr().(*net.TCPAddr)
+	bindAddr, _ := remote.LocalAddr().(*net.TCPAddr)
+	if bindAddr == nil {
+		bindAddr = &net.TCPAddr{}
+	}
 	reply := s.buildSOCKS5Reply(SOCKS5RepSuccess, bindAddr)
 	if _, err := conn.Write(reply); err != nil {
 		return
 	}
 
-	log.Printf("%s connected to %s", clientIP, target)
+	log.Printf("%s connected to %s", clientIP, sanitizeLog(target))
 
 	s.relay(newIdleConn(conn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
@@ -563,11 +736,14 @@ func (s *Server) buildSOCKS5Reply(rep byte, bindAddr *net.TCPAddr) []byte {
 
 // handleHTTP handles HTTP CONNECT method
 func (s *Server) handleHTTP(conn *ConnectionWrapper) {
-	clientIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+	clientIP := extractIP(conn.RemoteAddr())
 
-	// Read HTTP request line
-	reader := bufio.NewReader(conn.reader)
-	requestLine, err := reader.ReadString('\n')
+	// Read the request line and headers directly from the wrapper's buffered
+	// reader under a hard byte cap. Reading from conn.reader (not a second
+	// bufio wrapper) preserves bytes pipelined after the headers for the
+	// tunnel, and the budget stops multi-GB header flooding.
+	budget := maxHTTPHeaderBytes
+	requestLine, err := readHTTPLine(conn.reader, &budget)
 	if err != nil {
 		return
 	}
@@ -590,7 +766,7 @@ func (s *Server) handleHTTP(conn *ConnectionWrapper) {
 	// Read headers
 	headers := make(map[string]string)
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readHTTPLine(conn.reader, &budget)
 		if err != nil {
 			return
 		}
@@ -626,29 +802,30 @@ func (s *Server) handleHTTP(conn *ConnectionWrapper) {
 		return
 	}
 
-	// Block certain ports
-	blockedPorts := map[int]bool{22: true, 23: true, 25: true, 3306: true, 5432: true, 6379: true, 27017: true}
-	if blockedPorts[port] {
+	// Block certain ports (same policy on all protocols)
+	if blockedTargetPorts[port] {
 		s.sendHTTPError(conn, 403, "Port Not Allowed")
 		return
 	}
-	if !s.isSafeTarget(host) {
-		s.sendHTTPError(conn, 403, "Target Not Allowed")
+
+	// Resolve and validate once, then dial the validated IP literally.
+	addrs, err := s.resolveTarget(host)
+	if err != nil {
+		if errors.Is(err, errBlockedTarget) {
+			log.Printf("Blocked unsafe HTTP target from %s to %s", clientIP, sanitizeLog(target))
+			s.sendHTTPError(conn, 403, "Target Not Allowed")
+		} else {
+			log.Printf("Failed to resolve HTTP target %s from %s: %v", sanitizeLog(host), clientIP, err)
+			s.sendHTTPError(conn, 502, "Bad Gateway")
+		}
 		return
 	}
 
-	// Connect to target
 	targetAddr := net.JoinHostPort(host, portStr)
-	var remote net.Conn
-
-	if s.config.ForceIPv4 {
-		remote, err = s.dialIPv4(targetAddr, s.config.ConnectionTimeout)
-	} else {
-		remote, err = net.DialTimeout("tcp", targetAddr, s.config.ConnectionTimeout)
-	}
+	remote, err := s.dialTarget(addrs, port)
 
 	if err != nil {
-		log.Printf("Failed to connect to %s: %v", targetAddr, err)
+		log.Printf("Failed to connect to %s: %v", sanitizeLog(targetAddr), err)
 		s.sendHTTPError(conn, 502, "Bad Gateway")
 		return
 	}
@@ -656,7 +833,7 @@ func (s *Server) handleHTTP(conn *ConnectionWrapper) {
 
 	// Send success response
 	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	log.Printf("%s connected to %s via HTTP", clientIP, targetAddr)
+	log.Printf("%s connected to %s via HTTP", clientIP, sanitizeLog(targetAddr))
 
 	s.relay(newIdleConn(conn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
@@ -718,58 +895,73 @@ func (s *Server) sendHTTPAuthRequired(conn net.Conn) {
 	conn.Write([]byte(response))
 }
 
-// isSafeTarget blocks loopback, private, and link-local destinations.
-func (s *Server) isSafeTarget(host string) bool {
+// isBlockedIP reports whether addr is a non-public destination: loopback,
+// private, link-local, multicast, unspecified (0.0.0.0/:: — on Linux, dialing
+// 0.0.0.0 reaches loopback services), or CGNAT shared space.
+func isBlockedIP(addr netip.Addr) bool {
+	return addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsUnspecified() ||
+		addr.IsMulticast() ||
+		cgnatPrefix.Contains(addr)
+}
+
+// resolveTarget resolves host once and validates every returned address
+// against the egress policy. Callers MUST dial the returned addresses
+// directly (never re-resolve the hostname) or the validation is vulnerable
+// to DNS-rebinding TOCTOU.
+func (s *Server) resolveTarget(host string) ([]netip.Addr, error) {
 	host = strings.Trim(strings.TrimSpace(host), "[]")
-	if host == "" {
-		return false
-	}
-	if strings.EqualFold(host, "localhost") {
-		return false
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return nil, errBlockedTarget
 	}
 
 	if addr, err := netip.ParseAddr(host); err == nil {
-		return !(addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast())
+		if isBlockedIP(addr) {
+			return nil, errBlockedTarget
+		}
+		return []netip.Addr{addr}, nil
 	}
 
-	ips, err := net.LookupIP(host)
+	ctx, cancel := context.WithTimeout(context.Background(), s.config.ConnectionTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		log.Printf("Target DNS lookup failed for %s: %v", host, err)
-		return false
+		return nil, fmt.Errorf("target DNS lookup failed for %s: %w", sanitizeLog(host), err)
 	}
+
+	addrs := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
-		addr, ok := netip.AddrFromSlice(ip)
+		addr, ok := netip.AddrFromSlice(ip.IP)
 		if !ok {
 			continue
 		}
-		if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
-			return false
+		if isBlockedIP(addr) {
+			return nil, errBlockedTarget
 		}
+		addrs = append(addrs, addr)
 	}
-	return true
+	if len(addrs) == 0 {
+		return nil, errors.New("no usable addresses for target")
+	}
+	return addrs, nil
 }
 
-// dialIPv4 dials a connection forcing IPv4
-func (s *Server) dialIPv4(address string, timeout time.Duration) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-
-	addrs, err := net.LookupIP(host)
-	if err != nil {
-		return nil, err
-	}
-
+// dialTarget dials pre-validated addresses without any further DNS lookups.
+func (s *Server) dialTarget(addrs []netip.Addr, port int) (net.Conn, error) {
+	portStr := strconv.Itoa(port)
 	var lastErr error
 	for _, addr := range addrs {
-		if addr.To4() != nil {
-			conn, err := net.DialTimeout("tcp4", net.JoinHostPort(addr.String(), port), timeout)
-			if err == nil {
-				return conn, nil
-			}
-			lastErr = err
+		if s.config.ForceIPv4 && !addr.Is4() {
+			continue
 		}
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr.String(), portStr), s.config.ConnectionTimeout)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
 	}
 
 	if lastErr != nil {
@@ -808,48 +1000,63 @@ func (c *idleConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite forwards a half-close to the wrapped connection when supported.
+func (c *idleConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+// closeWrite signals EOF on dst without destroying it, so the reverse
+// direction of a relay can keep flowing (proper TCP half-close semantics).
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	c.Close()
+}
+
 // relay bidirectionally relays data between two connections.
 // Both sides are wrapped with idleConn so the deadline resets on every
 // successful read/write — a long video stream is never killed mid-transfer.
+// When one direction ends, only that direction is closed (half-close): a
+// client FIN must not truncate response bytes still in flight.
 func (s *Server) relay(conn1, conn2 net.Conn) {
-	done := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	copyData := func(dst, src net.Conn) {
+		defer wg.Done()
 		buf := make([]byte, BufferSize)
-		_, err := io.CopyBuffer(dst, src, buf)
-		done <- err
+		_, _ = io.CopyBuffer(dst, src, buf)
+		closeWrite(dst)
 	}
 
 	go copyData(conn1, conn2)
 	go copyData(conn2, conn1)
 
-	// Wait for one direction to finish
-	<-done
-
-	// Close both connections to terminate the other direction
-	conn1.Close()
-	conn2.Close()
-
-	// Wait for second direction
-	<-done
+	wg.Wait()
 }
 
 // Shadowsocks AEAD Cipher implementation
 type ShadowsocksCipher struct {
 	key    []byte
 	cipher string
+	replay *replayCache
 }
 
-func NewShadowsocksCipher(password, method string) (*ShadowsocksCipher, error) {
+func NewShadowsocksCipher(password, method string, replay *replayCache) (*ShadowsocksCipher, error) {
 	var keySize int
 	switch method {
 	case "aes-128-gcm":
 		keySize = 16
 	case "aes-256-gcm":
 		keySize = 32
-	case "chacha20-ietf-poly1305":
-		keySize = 32
 	default:
+		// Only ciphers actually implemented by newAEAD are accepted, so a
+		// misconfiguration fails at startup instead of per-connection.
 		return nil, fmt.Errorf("unsupported cipher: %s", method)
 	}
 
@@ -857,6 +1064,7 @@ func NewShadowsocksCipher(password, method string) (*ShadowsocksCipher, error) {
 	return &ShadowsocksCipher{
 		key:    key,
 		cipher: method,
+		replay: replay,
 	}, nil
 }
 
@@ -883,14 +1091,9 @@ func MD5Sum(data []byte) []byte {
 	return hash[:]
 }
 
-// HKDF-SHA1 key derivation for AEAD ciphers
+// HKDF-SHA1 key derivation for AEAD ciphers (stdlib crypto/hkdf, Go 1.24+)
 func hkdfSHA1(secret, salt, info []byte, keyLen int) ([]byte, error) {
-	r := hkdf.New(sha1.New, secret, salt, info)
-	key := make([]byte, keyLen)
-	if _, err := io.ReadFull(r, key); err != nil {
-		return nil, err
-	}
-	return key, nil
+	return hkdf.Key(sha1.New, secret, salt, string(info), keyLen)
 }
 
 // newAEAD creates an AEAD cipher from salt
@@ -907,8 +1110,6 @@ func (sc *ShadowsocksCipher) newAEAD(salt []byte) (cipher.AEAD, error) {
 			return nil, err
 		}
 		return cipher.NewGCM(block)
-	case "chacha20-ietf-poly1305":
-		return nil, fmt.Errorf("chacha20-poly1305 not implemented in minimal version")
 	default:
 		return nil, fmt.Errorf("unsupported cipher: %s", sc.cipher)
 	}
@@ -945,6 +1146,11 @@ func (sc *ShadowsocksCipher) wrapConn(conn net.Conn) (*ShadowsocksConn, error) {
 	salt := make([]byte, saltSize)
 	if _, err := io.ReadFull(conn, salt); err != nil {
 		return nil, fmt.Errorf("failed to read client salt: %w", err)
+	}
+
+	// Reject replayed handshakes: a salt may only be used once.
+	if sc.replay != nil && !sc.replay.checkOrAdd(salt) {
+		return nil, errors.New("replayed Shadowsocks salt rejected")
 	}
 
 	readAEAD, err := sc.newAEAD(salt)
@@ -1001,8 +1207,8 @@ func (c *ShadowsocksConn) Read(b []byte) (n int, err error) {
 	increment(c.readNonce)
 
 	payloadLen := binary.BigEndian.Uint16(lengthBuf)
-	if payloadLen > 0x3FFF {
-		return 0, fmt.Errorf("payload length too large: %d", payloadLen)
+	if payloadLen < 1 || payloadLen > 0x3FFF {
+		return 0, fmt.Errorf("invalid payload length: %d", payloadLen)
 	}
 
 	// Read encrypted payload
@@ -1070,12 +1276,20 @@ func increment(nonce []byte) {
 	}
 }
 
+// CloseWrite forwards a half-close past the AEAD wrapper when supported.
+func (c *ShadowsocksConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
 // handleShadowsocks handles Shadowsocks protocol.
 func (s *Server) handleShadowsocks(conn net.Conn) {
-	clientIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+	clientIP := extractIP(conn.RemoteAddr())
 
 	// Create cipher
-	cipher, err := NewShadowsocksCipher(s.config.ShadowsocksKey, s.config.ShadowsocksCipher)
+	cipher, err := NewShadowsocksCipher(s.config.ShadowsocksKey, s.config.ShadowsocksCipher, s.replay)
 	if err != nil {
 		log.Printf("Failed to create Shadowsocks cipher: %v", err)
 		return
@@ -1142,28 +1356,32 @@ func (s *Server) handleShadowsocks(conn net.Conn) {
 	}
 	port = binary.BigEndian.Uint16(portBuf)
 
-	// Connect to target
+	// Connect to target (same egress port policy as the other protocols)
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
-	if !s.isSafeTarget(host) {
-		log.Printf("Blocked unsafe Shadowsocks target from %s to %s", clientIP, target)
+	if blockedTargetPorts[int(port)] {
+		log.Printf("Blocked Shadowsocks egress port %d from %s to %s", port, clientIP, sanitizeLog(target))
 		return
 	}
 
-	var remote net.Conn
-	if s.config.ForceIPv4 {
-		remote, err = s.dialIPv4(target, s.config.ConnectionTimeout)
-	} else {
-		remote, err = net.DialTimeout("tcp", target, s.config.ConnectionTimeout)
+	addrs, err := s.resolveTarget(host)
+	if err != nil {
+		if errors.Is(err, errBlockedTarget) {
+			log.Printf("Blocked unsafe Shadowsocks target from %s to %s", clientIP, sanitizeLog(target))
+		} else {
+			log.Printf("Shadowsocks: Failed to resolve %s from %s: %v", sanitizeLog(host), clientIP, err)
+		}
+		return
 	}
 
+	remote, err := s.dialTarget(addrs, int(port))
 	if err != nil {
-		log.Printf("Shadowsocks: Failed to connect to %s: %v", target, err)
+		log.Printf("Shadowsocks: Failed to connect to %s: %v", sanitizeLog(target), err)
 		return
 	}
 	defer remote.Close()
 
-	log.Printf("%s connected to %s via Shadowsocks", clientIP, target)
+	log.Printf("%s connected to %s via Shadowsocks", clientIP, sanitizeLog(target))
 
 	s.relay(newIdleConn(ssConn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
@@ -1197,7 +1415,51 @@ func getEnvBool(name string, defaultVal bool) bool {
 	return val == "1" || val == "true" || val == "yes" || val == "on"
 }
 
+// runHealthCheck probes the local proxy end to end: connect, authenticate
+// with the configured credentials, and issue a CONNECT to a loopback target.
+// The egress policy must reject it with 403 — anything else (or no answer)
+// means the accept loop, protocol detection, or auth path is broken.
+// Returns the process exit code.
+func runHealthCheck(config *Config) int {
+	addr := fmt.Sprintf("127.0.0.1:%d", config.Port)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: dial failed: %v\n", err)
+		return 1
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+
+	creds := base64.StdEncoding.EncodeToString([]byte(config.Username + ":" + config.Password))
+	req := fmt.Sprintf("CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\nProxy-Authorization: Basic %s\r\n\r\n", creds)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: write failed: %v\n", err)
+		return 1
+	}
+
+	line, err := bufio.NewReaderSize(conn, 256).ReadString('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: no response: %v\n", err)
+		return 1
+	}
+	if strings.HasPrefix(line, "HTTP/1.1 403") {
+		fmt.Println("healthcheck: ok")
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "healthcheck: unexpected response: %q\n", strings.TrimRight(line, "\r\n"))
+	return 1
+}
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
+	healthCheck := flag.Bool("healthcheck", false, "probe the local proxy listener and exit 0 (healthy) or 1 (unhealthy)")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("gost-proxy %s\n", appVersion)
+		os.Exit(0)
+	}
+
 	// Load configuration from environment
 	config := &Config{
 		Host:              os.Getenv("GOST_HOST"),
@@ -1208,12 +1470,17 @@ func main() {
 		ShadowsocksCipher: os.Getenv("GOST_SS_CIPHER"),
 		MaxConnections:    getEnvInt("GOST_MAX_CONN", 200, 1, 10000),
 		HandshakeTimeout:  time.Duration(getEnvInt("GOST_HANDSHAKE_TIMEOUT", 30, 5, 300)) * time.Second,
+		SniffTimeout:      time.Duration(getEnvInt("GOST_SNIFF_TIMEOUT", 10, 1, 60)) * time.Second,
 		ConnectionTimeout: time.Duration(getEnvInt("GOST_TIMEOUT", 15, 3, 300)) * time.Second,
 		IdleTimeout:       time.Duration(getEnvInt("GOST_IDLE_TIMEOUT", 300, 5, 86400)) * time.Second,
 		AuthFailLimit:     getEnvInt("GOST_AUTH_FAIL_LIMIT", 5, 1, 100),
 		AuthFailWindow:    time.Duration(getEnvInt("GOST_AUTH_FAIL_WINDOW", 60, 1, 3600)) * time.Second,
 		AllowNoAuth:       getEnvBool("GOST_ALLOW_NOAUTH", false),
 		ForceIPv4:         getEnvBool("GOST_FORCE_IPV4", true),
+	}
+
+	if *healthCheck {
+		os.Exit(runHealthCheck(config))
 	}
 
 	// Set default Shadowsocks cipher if key provided but cipher not specified
@@ -1224,6 +1491,18 @@ func main() {
 	// Validate required config
 	if config.Username == "" || config.Password == "" {
 		log.Fatal("GOST_USER and GOST_PASS must be set")
+	}
+
+	// Fail fast on an unimplemented Shadowsocks cipher instead of dropping
+	// every connection at runtime.
+	if config.ShadowsocksKey != "" {
+		sc, err := NewShadowsocksCipher(config.ShadowsocksKey, config.ShadowsocksCipher, nil)
+		if err != nil {
+			log.Fatalf("Invalid GOST_SS_CIPHER: %v", err)
+		}
+		if _, err := sc.newAEAD(make([]byte, sc.getSaltSize())); err != nil {
+			log.Fatalf("Invalid GOST_SS_CIPHER: %v", err)
+		}
 	}
 
 	if config.Host == "" {

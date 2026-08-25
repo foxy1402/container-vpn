@@ -1,0 +1,6 @@
+# Credentials — never commit real values
+.env
+
+# Build artifacts and logs
+build-*.log
+*.exe

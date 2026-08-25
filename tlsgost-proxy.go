@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -15,6 +16,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -53,7 +55,34 @@ const (
 	SOCKS5RepAtypNotSupported = 0x08
 
 	BufferSize = 32 * 1024
+
+	// appVersion is reported by -version.
+	appVersion = "1.1.0"
+
+	// maxHTTPHeaderBytes caps the request line + header block a client may
+	// send before the connection is dropped (memory-DoS guard).
+	maxHTTPHeaderBytes = 8 * 1024
+
+	// maxAuthFailureEntries bounds the per-IP auth failure map.
+	maxAuthFailureEntries = 10000
 )
+
+// errBlockedTarget marks egress-policy rejections in resolveTarget errors.
+var errBlockedTarget = errors.New("target blocked by egress policy")
+
+// cgnatPrefix is the shared CGNAT space (RFC 6598), treated as internal.
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// blockedTargetPorts are egress ports never proxied to, on every protocol.
+var blockedTargetPorts = map[int]bool{
+	22:    true, // SSH
+	23:    true, // Telnet
+	25:    true, // SMTP (outbound spam relay)
+	3306:  true, // MySQL
+	5432:  true, // PostgreSQL
+	6379:  true, // Redis
+	27017: true, // MongoDB
+}
 
 type Config struct {
 	Host              string
@@ -64,8 +93,10 @@ type Config struct {
 	TLSKeyFile        string
 	TLSMinVersion     uint16
 	SNI               string
+	CertIPs           []net.IP
 	MaxConnections    int
 	HandshakeTimeout  time.Duration
+	SniffTimeout      time.Duration
 	ConnectionTimeout time.Duration
 	IdleTimeout       time.Duration
 	AuthFailLimit     int
@@ -110,6 +141,16 @@ func (w *ConnectionWrapper) Peek(n int) ([]byte, error) {
 	return w.reader.Peek(n)
 }
 
+// CloseWrite half-closes the underlying connection when it supports it (a
+// *tls.Conn sends close_notify), so a finished relay direction can signal
+// EOF without killing the other.
+func (w *ConnectionWrapper) CloseWrite() error {
+	if cw, ok := w.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return w.Conn.Close()
+}
+
 func NewServer(config *Config) *Server {
 	return &Server{
 		config:        config,
@@ -137,7 +178,7 @@ func (s *Server) buildTLSConfig() error {
 		log.Printf("Loaded TLS certificate from %s", s.config.TLSCertFile)
 	} else {
 		var err error
-		cert, expiry, err = generateSelfSignedCert(s.config.SNI)
+		cert, expiry, err = generateSelfSignedCert(s.config.SNI, s.config.CertIPs)
 		if err != nil {
 			return fmt.Errorf("failed to generate self-signed cert: %w", err)
 		}
@@ -153,7 +194,23 @@ func (s *Server) buildTLSConfig() error {
 			return s.certPtr.Load(), nil
 		},
 		MinVersion: s.config.TLSMinVersion,
+		// The server speaks neither h2 nor HTTP/1.1 at the application layer;
+		// advertising them keeps the TLS fingerprint plausible to observers.
 		NextProtos: []string{"h2", "http/1.1"},
+	}
+
+	if s.config.TLSMinVersion == tls.VersionTLS12 {
+		// TLS 1.2 requested via TLSGOST_TLS_MIN_VERSION: restrict to AEAD
+		// cipher suites (the Go defaults include CBC).
+		tlsCfg.CipherSuites = []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		}
+		log.Println("WARNING: TLS minimum version set to 1.2; TLS 1.3 is recommended (TLSGOST_TLS_MIN_VERSION=1.3)")
 	}
 
 	if s.config.SNI != "" {
@@ -169,7 +226,7 @@ func (s *Server) buildTLSConfig() error {
 	return nil
 }
 
-func generateSelfSignedCert(domain string) (tls.Certificate, time.Time, error) {
+func generateSelfSignedCert(domain string, ips []net.IP) (tls.Certificate, time.Time, error) {
 	if domain == "" {
 		domain = "example.com"
 	}
@@ -194,6 +251,7 @@ func generateSelfSignedCert(domain string) (tls.Certificate, time.Time, error) {
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{domain},
+		IPAddresses:  ips,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
@@ -260,15 +318,25 @@ func (s *Server) Start() error {
 
 	go s.handleSignals()
 
+	acceptFails := 0
 	for s.running.Load() {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if s.running.Load() {
+				acceptFails++
 				log.Printf("Accept error: %v", err)
+				// Back off so a persistent accept failure (e.g. fd
+				// exhaustion) does not spin CPU and flood the log.
+				backoff := time.Duration(acceptFails) * 10 * time.Millisecond
+				if backoff > time.Second {
+					backoff = time.Second
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			break
 		}
+		acceptFails = 0
 
 		select {
 		case s.connSemaphore <- struct{}{}:
@@ -294,33 +362,91 @@ func (s *Server) certFingerprint() string {
 }
 
 func (s *Server) startCertRenewal() {
-	if !s.selfSigned {
+	if s.selfSigned {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-s.shutdown:
+					return
+				case <-ticker.C:
+					remaining := time.Until(s.certExpiry)
+					if remaining < 30*24*time.Hour {
+						s.renewCert()
+					} else {
+						log.Printf("Certificate valid for %d more days", int(remaining.Hours()/24))
+					}
+				}
+			}
+		}()
+		return
+	}
+
+	// User-provided certificates: watch the mounted files and hot-reload
+	// when they change (certbot renewals, rotated k8s secrets). Note that
+	// self-signed renewal rotates the key, so client fingerprint pinning
+	// changes on rotation — that is intentional for generated certs.
+	if s.config.TLSCertFile == "" {
 		return
 	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		ticker := time.NewTicker(24 * time.Hour)
+		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
+		lastMod := certModTime(s.config.TLSCertFile, s.config.TLSKeyFile)
 
 		for {
 			select {
 			case <-s.shutdown:
 				return
 			case <-ticker.C:
-				remaining := time.Until(s.certExpiry)
-				if remaining < 30*24*time.Hour {
-					s.renewCert()
-				} else {
-					log.Printf("Certificate valid for %d more days", int(remaining.Hours()/24))
+				mod := certModTime(s.config.TLSCertFile, s.config.TLSKeyFile)
+				if mod.Equal(lastMod) {
+					continue
 				}
+				lastMod = mod
+				s.reloadCert()
 			}
 		}
 	}()
 }
 
+func certModTime(files ...string) time.Time {
+	var latest time.Time
+	for _, f := range files {
+		if f == "" {
+			continue
+		}
+		if fi, err := os.Stat(f); err == nil && fi.ModTime().After(latest) {
+			latest = fi.ModTime()
+		}
+	}
+	return latest
+}
+
+func (s *Server) reloadCert() {
+	cert, err := tls.LoadX509KeyPair(s.config.TLSCertFile, s.config.TLSKeyFile)
+	if err != nil {
+		log.Printf("Failed to reload TLS certificate: %v (keeping previous)", err)
+		return
+	}
+	s.certPtr.Store(&cert)
+	if len(cert.Certificate) > 0 {
+		if parsed, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+			s.certExpiry = parsed.NotAfter
+		}
+	}
+	log.Printf("Reloaded TLS certificate from %s (expires %s)", s.config.TLSCertFile, s.certExpiry.Format("2006-01-02"))
+	log.Printf("New certificate SHA-256: %s", s.certFingerprint())
+}
+
 func (s *Server) renewCert() {
-	cert, expiry, err := generateSelfSignedCert(s.config.SNI)
+	cert, expiry, err := generateSelfSignedCert(s.config.SNI, s.config.CertIPs)
 	if err != nil {
 		log.Printf("Failed to renew self-signed certificate: %v", err)
 		return
@@ -396,7 +522,10 @@ func (s *Server) handleConnection(rawConn net.Conn) {
 
 	conn := NewConnectionWrapper(tlsConn)
 
-	rawConn.SetReadDeadline(time.Now().Add(s.config.HandshakeTimeout))
+	// Protocol detection runs after the TLS handshake but before auth, so it
+	// uses the shorter sniff timeout: an unauthenticated client cannot hold
+	// a connection slot for the full handshake window by dribbling bytes.
+	rawConn.SetReadDeadline(time.Now().Add(s.config.SniffTimeout))
 	protocol, err := s.detectProtocol(conn)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -454,12 +583,18 @@ func (s *Server) checkRateLimit(ip string) bool {
 	now := time.Now()
 	cutoff := now.Add(-s.config.AuthFailWindow)
 
+	// Clean old entries; delete the key entirely once empty so the map
+	// cannot grow forever under rotating/spoofed source IPs.
 	failures := s.authFailures[ip]
 	validFailures := make([]time.Time, 0)
 	for _, t := range failures {
 		if t.After(cutoff) {
 			validFailures = append(validFailures, t)
 		}
+	}
+	if len(validFailures) == 0 {
+		delete(s.authFailures, ip)
+		return true
 	}
 	s.authFailures[ip] = validFailures
 
@@ -473,6 +608,16 @@ func (s *Server) checkRateLimit(ip string) bool {
 func (s *Server) recordAuthFailure(ip string) {
 	s.authMutex.Lock()
 	defer s.authMutex.Unlock()
+
+	// Bound total tracked IPs; evict an arbitrary entry when full rather
+	// than letting the map grow without limit.
+	if _, ok := s.authFailures[ip]; !ok && len(s.authFailures) >= maxAuthFailureEntries {
+		for k := range s.authFailures {
+			delete(s.authFailures, k)
+			break
+		}
+	}
+
 	s.authFailures[ip] = append(s.authFailures[ip], time.Now())
 }
 
@@ -585,21 +730,32 @@ func (s *Server) handleSOCKS5(conn *ConnectionWrapper) {
 	port := binary.BigEndian.Uint16(portBuf)
 
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
-	if !s.isSafeTarget(host) {
-		log.Printf("Blocked unsafe SOCKS5+TLS target from %s to %s", clientIP, target)
+
+	// Egress port policy applies on every protocol (HTTP CONNECT included),
+	// so the proxy cannot be abused e.g. for SMTP spam relay over SOCKS5.
+	if blockedTargetPorts[int(port)] {
+		log.Printf("Blocked SOCKS5+TLS egress port %d from %s to %s", port, clientIP, sanitizeLog(target))
 		s.sendSOCKS5Reply(conn, SOCKS5RepNotAllowed)
 		return
 	}
 
-	var remote net.Conn
-	if s.config.ForceIPv4 {
-		remote, err = s.dialIPv4(target, s.config.ConnectionTimeout)
-	} else {
-		remote, err = net.DialTimeout("tcp", target, s.config.ConnectionTimeout)
+	// Resolve and validate once, then dial the validated IP literally —
+	// re-resolving here would open a DNS-rebinding TOCTOU window.
+	addrs, err := s.resolveTarget(host)
+	if err != nil {
+		if errors.Is(err, errBlockedTarget) {
+			log.Printf("Blocked unsafe SOCKS5+TLS target from %s to %s", clientIP, sanitizeLog(target))
+			s.sendSOCKS5Reply(conn, SOCKS5RepNotAllowed)
+		} else {
+			log.Printf("Failed to resolve SOCKS5+TLS target %s from %s: %v", sanitizeLog(host), clientIP, err)
+			s.sendSOCKS5Reply(conn, SOCKS5RepHostUnreachable)
+		}
+		return
 	}
 
+	remote, err := s.dialTarget(addrs, int(port))
 	if err != nil {
-		log.Printf("Failed to connect to %s: %v", target, err)
+		log.Printf("Failed to connect to %s: %v", sanitizeLog(target), err)
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			s.sendSOCKS5Reply(conn, SOCKS5RepTTLExpired)
 		} else {
@@ -609,13 +765,16 @@ func (s *Server) handleSOCKS5(conn *ConnectionWrapper) {
 	}
 	defer remote.Close()
 
-	bindAddr := remote.LocalAddr().(*net.TCPAddr)
+	bindAddr, _ := remote.LocalAddr().(*net.TCPAddr)
+	if bindAddr == nil {
+		bindAddr = &net.TCPAddr{}
+	}
 	reply := s.buildSOCKS5Reply(SOCKS5RepSuccess, bindAddr)
 	if _, err := conn.Write(reply); err != nil {
 		return
 	}
 
-	log.Printf("%s connected to %s via SOCKS5+TLS", clientIP, target)
+	log.Printf("%s connected to %s via SOCKS5+TLS", clientIP, sanitizeLog(target))
 	s.relay(newIdleConn(conn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
 
@@ -693,7 +852,11 @@ func (s *Server) buildSOCKS5Reply(rep byte, bindAddr *net.TCPAddr) []byte {
 func (s *Server) handleHTTP(conn *ConnectionWrapper) {
 	clientIP := extractIP(conn.RemoteAddr())
 
-	requestLine, err := conn.reader.ReadString('\n')
+	// Read the request line and headers directly from the wrapper's buffered
+	// reader under a hard byte cap: stops multi-GB header flooding while
+	// preserving bytes pipelined after the headers for the tunnel.
+	budget := maxHTTPHeaderBytes
+	requestLine, err := readHTTPLine(conn.reader, &budget)
 	if err != nil {
 		return
 	}
@@ -714,7 +877,7 @@ func (s *Server) handleHTTP(conn *ConnectionWrapper) {
 
 	headers := make(map[string]string)
 	for {
-		line, err := conn.reader.ReadString('\n')
+		line, err := readHTTPLine(conn.reader, &budget)
 		if err != nil {
 			return
 		}
@@ -748,34 +911,36 @@ func (s *Server) handleHTTP(conn *ConnectionWrapper) {
 		return
 	}
 
-	blockedPorts := map[int]bool{22: true, 23: true, 25: true, 3306: true, 5432: true, 6379: true, 27017: true}
-	if blockedPorts[port] {
+	if blockedTargetPorts[port] {
 		s.sendHTTPError(conn, 403, "Port Not Allowed")
 		return
 	}
-	if !s.isSafeTarget(host) {
-		s.sendHTTPError(conn, 403, "Target Not Allowed")
+
+	// Resolve and validate once, then dial the validated IP literally.
+	addrs, err := s.resolveTarget(host)
+	if err != nil {
+		if errors.Is(err, errBlockedTarget) {
+			log.Printf("Blocked unsafe HTTP+TLS target from %s to %s", clientIP, sanitizeLog(target))
+			s.sendHTTPError(conn, 403, "Target Not Allowed")
+		} else {
+			log.Printf("Failed to resolve HTTP+TLS target %s from %s: %v", sanitizeLog(host), clientIP, err)
+			s.sendHTTPError(conn, 502, "Bad Gateway")
+		}
 		return
 	}
 
 	targetAddr := net.JoinHostPort(host, portStr)
-	var remote net.Conn
-
-	if s.config.ForceIPv4 {
-		remote, err = s.dialIPv4(targetAddr, s.config.ConnectionTimeout)
-	} else {
-		remote, err = net.DialTimeout("tcp", targetAddr, s.config.ConnectionTimeout)
-	}
+	remote, err := s.dialTarget(addrs, port)
 
 	if err != nil {
-		log.Printf("Failed to connect to %s: %v", targetAddr, err)
+		log.Printf("Failed to connect to %s: %v", sanitizeLog(targetAddr), err)
 		s.sendHTTPError(conn, 502, "Bad Gateway")
 		return
 	}
 	defer remote.Close()
 
 	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	log.Printf("%s connected to %s via HTTP+TLS", clientIP, targetAddr)
+	log.Printf("%s connected to %s via HTTP+TLS", clientIP, sanitizeLog(targetAddr))
 
 	s.relay(newIdleConn(conn, s.config.IdleTimeout), newIdleConn(remote, s.config.IdleTimeout))
 }
@@ -830,56 +995,73 @@ func (s *Server) sendHTTPAuthRequired(conn net.Conn) {
 	conn.Write([]byte(response))
 }
 
-func (s *Server) isSafeTarget(host string) bool {
+// isBlockedIP reports whether addr is a non-public destination: loopback,
+// private, link-local, multicast, unspecified (0.0.0.0/:: — on Linux, dialing
+// 0.0.0.0 reaches loopback services), or CGNAT shared space.
+func isBlockedIP(addr netip.Addr) bool {
+	return addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsUnspecified() ||
+		addr.IsMulticast() ||
+		cgnatPrefix.Contains(addr)
+}
+
+// resolveTarget resolves host once and validates every returned address
+// against the egress policy. Callers MUST dial the returned addresses
+// directly (never re-resolve the hostname) or the validation is vulnerable
+// to DNS-rebinding TOCTOU.
+func (s *Server) resolveTarget(host string) ([]netip.Addr, error) {
 	host = strings.Trim(strings.TrimSpace(host), "[]")
-	if host == "" {
-		return false
-	}
-	if strings.EqualFold(host, "localhost") {
-		return false
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return nil, errBlockedTarget
 	}
 
 	if addr, err := netip.ParseAddr(host); err == nil {
-		return !(addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast())
+		if isBlockedIP(addr) {
+			return nil, errBlockedTarget
+		}
+		return []netip.Addr{addr}, nil
 	}
 
-	ips, err := net.LookupIP(host)
+	ctx, cancel := context.WithTimeout(context.Background(), s.config.ConnectionTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		log.Printf("Target DNS lookup failed for %s: %v", host, err)
-		return false
+		return nil, fmt.Errorf("target DNS lookup failed for %s: %w", sanitizeLog(host), err)
 	}
+
+	addrs := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
-		addr, ok := netip.AddrFromSlice(ip)
+		addr, ok := netip.AddrFromSlice(ip.IP)
 		if !ok {
 			continue
 		}
-		if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
-			return false
+		if isBlockedIP(addr) {
+			return nil, errBlockedTarget
 		}
+		addrs = append(addrs, addr)
 	}
-	return true
+	if len(addrs) == 0 {
+		return nil, errors.New("no usable addresses for target")
+	}
+	return addrs, nil
 }
 
-func (s *Server) dialIPv4(address string, timeout time.Duration) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-
-	addrs, err := net.LookupIP(host)
-	if err != nil {
-		return nil, err
-	}
-
+// dialTarget dials pre-validated addresses without any further DNS lookups.
+func (s *Server) dialTarget(addrs []netip.Addr, port int) (net.Conn, error) {
+	portStr := strconv.Itoa(port)
 	var lastErr error
 	for _, addr := range addrs {
-		if addr.To4() != nil {
-			conn, err := net.DialTimeout("tcp4", net.JoinHostPort(addr.String(), port), timeout)
-			if err == nil {
-				return conn, nil
-			}
-			lastErr = err
+		if s.config.ForceIPv4 && !addr.Is4() {
+			continue
 		}
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr.String(), portStr), s.config.ConnectionTimeout)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
 	}
 
 	if lastErr != nil {
@@ -894,6 +1076,42 @@ func extractIP(addr net.Addr) string {
 		return addr.String()
 	}
 	return host
+}
+
+// sanitizeLog strips control characters from client-supplied strings so a
+// malicious target host cannot forge log lines (newline injection).
+func sanitizeLog(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// errHeaderTooLarge is returned when the HTTP header block exceeds the cap.
+var errHeaderTooLarge = errors.New("header section too large")
+
+// readHTTPLine reads one CRLF/LF-terminated line directly from the wrapper's
+// buffered reader, enforcing a shared byte budget across the whole header
+// block. Byte-by-byte reads on the buffered reader are cheap and guarantee no
+// pipelined tunnel bytes are swallowed into a second buffer.
+func readHTTPLine(r *bufio.Reader, budget *int) (string, error) {
+	var sb strings.Builder
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		*budget--
+		if *budget < 0 {
+			return "", errHeaderTooLarge
+		}
+		sb.WriteByte(b)
+		if b == '\n' {
+			return sb.String(), nil
+		}
+	}
 }
 
 type idleConn struct {
@@ -922,24 +1140,41 @@ func (c *idleConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite forwards a half-close to the wrapped connection when supported.
+func (c *idleConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+// closeWrite signals EOF on dst without destroying it, so the reverse
+// direction of a relay can keep flowing (proper TCP half-close semantics).
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	c.Close()
+}
+
 func (s *Server) relay(conn1, conn2 net.Conn) {
-	done := make(chan error, 2)
+	// Half-close semantics: when one direction ends, only that direction is
+	// closed — a client FIN must not truncate response bytes in flight.
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	copyData := func(dst, src net.Conn) {
+		defer wg.Done()
 		buf := make([]byte, BufferSize)
-		_, err := io.CopyBuffer(dst, src, buf)
-		done <- err
+		_, _ = io.CopyBuffer(dst, src, buf)
+		closeWrite(dst)
 	}
 
 	go copyData(conn1, conn2)
 	go copyData(conn2, conn1)
 
-	<-done
-
-	conn1.Close()
-	conn2.Close()
-
-	<-done
+	wg.Wait()
 }
 
 func getEnvInt(name string, defaultVal, min, max int) int {
@@ -979,7 +1214,63 @@ func parseTLSMinVersion(v string) uint16 {
 	}
 }
 
+// runHealthCheck probes the local proxy end to end: complete a TLS handshake
+// against the live listener, authenticate with the configured credentials,
+// and issue a CONNECT to a loopback target. The egress policy must reject it
+// with 403 — anything else (or no answer) means the TLS stack, accept loop,
+// protocol detection, or auth path is broken. Returns the process exit code.
+func runHealthCheck(config *Config) int {
+	addr := fmt.Sprintf("127.0.0.1:%d", config.Port)
+
+	serverName := config.SNI
+	if serverName == "" {
+		serverName = "localhost"
+	}
+
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, &tls.Config{
+		// This is a liveness probe against the local listener, not a trust
+		// decision; the cert may be self-signed, so verification is off.
+		InsecureSkipVerify: true, //nolint:gosec
+		ServerName:         serverName,
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: TLS handshake failed: %v\n", err)
+		return 1
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+
+	creds := base64.StdEncoding.EncodeToString([]byte(config.Username + ":" + config.Password))
+	req := fmt.Sprintf("CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\nProxy-Authorization: Basic %s\r\n\r\n", creds)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: write failed: %v\n", err)
+		return 1
+	}
+
+	line, err := bufio.NewReaderSize(conn, 256).ReadString('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: no response: %v\n", err)
+		return 1
+	}
+	if strings.HasPrefix(line, "HTTP/1.1 403") {
+		fmt.Println("healthcheck: ok")
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "healthcheck: unexpected response: %q\n", strings.TrimRight(line, "\r\n"))
+	return 1
+}
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
+	healthCheck := flag.Bool("healthcheck", false, "probe the local proxy over TLS and exit 0 (healthy) or 1 (unhealthy)")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("tlsgost-proxy %s\n", appVersion)
+		os.Exit(0)
+	}
+
 	config := &Config{
 		Host:              os.Getenv("TLSGOST_HOST"),
 		Port:              getEnvInt("TLSGOST_PORT", 8443, 1, 65535),
@@ -991,12 +1282,31 @@ func main() {
 		SNI:               os.Getenv("TLSGOST_SNI"),
 		MaxConnections:    getEnvInt("TLSGOST_MAX_CONN", 200, 1, 10000),
 		HandshakeTimeout:  time.Duration(getEnvInt("TLSGOST_HANDSHAKE_TIMEOUT", 30, 5, 300)) * time.Second,
+		SniffTimeout:      time.Duration(getEnvInt("TLSGOST_SNIFF_TIMEOUT", 10, 1, 60)) * time.Second,
 		ConnectionTimeout: time.Duration(getEnvInt("TLSGOST_TIMEOUT", 15, 3, 300)) * time.Second,
 		IdleTimeout:       time.Duration(getEnvInt("TLSGOST_IDLE_TIMEOUT", 300, 5, 86400)) * time.Second,
 		AuthFailLimit:     getEnvInt("TLSGOST_AUTH_FAIL_LIMIT", 5, 1, 100),
 		AuthFailWindow:    time.Duration(getEnvInt("TLSGOST_AUTH_FAIL_WINDOW", 60, 1, 3600)) * time.Second,
 		AllowNoAuth:       getEnvBool("TLSGOST_ALLOW_NOAUTH", false),
 		ForceIPv4:         getEnvBool("TLSGOST_FORCE_IPV4", true),
+	}
+
+	// Optional IP SANs for the self-signed certificate (clients connecting
+	// by raw IP need one to verify the cert).
+	for _, s := range strings.Split(os.Getenv("TLSGOST_CERT_IPS"), ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		ip, err := netip.ParseAddr(s)
+		if err != nil {
+			log.Fatalf("TLSGOST_CERT_IPS: invalid IP %q", s)
+		}
+		config.CertIPs = append(config.CertIPs, net.IP(ip.AsSlice()))
+	}
+
+	if *healthCheck {
+		os.Exit(runHealthCheck(config))
 	}
 
 	if config.Username == "" || config.Password == "" {

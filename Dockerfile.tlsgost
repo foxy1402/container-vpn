@@ -1,4 +1,5 @@
-FROM golang:1.22-alpine AS builder
+# Pinned by digest for reproducible builds (update deliberately, rebuild on CVEs)
+FROM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS builder
 
 RUN apk add --no-cache git ca-certificates
 
@@ -7,6 +8,7 @@ WORKDIR /build
 ARG TARGETOS
 ARG TARGETARCH
 
+# Module has no external dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -17,11 +19,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     -ldflags="-w -s" \
     -o tlsgost-proxy tlsgost-proxy.go
 
-FROM debian:13-slim
+FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
 LABEL org.opencontainers.image.title="TLSGost TLS Proxy"
 LABEL org.opencontainers.image.description="SOCKS5+TLS and HTTP CONNECT+TLS proxy with auto-generated or custom TLS certificates"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="1.1.0"
 LABEL org.opencontainers.image.authors="CloudProxy"
 LABEL service.type="tlsgost"
 
@@ -39,6 +41,8 @@ RUN chmod +x /app/tlsgost-proxy
 RUN useradd -r -u 1000 -s /bin/false appuser && \
     chown -R appuser:appuser /app
 
+# TLSGOST_USER/TLSGOST_PASS travel as env vars - visible via `docker inspect`
+# and /proc/<pid>/environ. Prefer Docker secrets for sensitive deployments.
 ENV TLSGOST_HOST=0.0.0.0 \
     TLSGOST_PORT=8443 \
     TLSGOST_USER= \
@@ -47,8 +51,10 @@ ENV TLSGOST_HOST=0.0.0.0 \
     TLSGOST_TLS_KEY= \
     TLSGOST_TLS_MIN_VERSION=1.3 \
     TLSGOST_SNI= \
+    TLSGOST_CERT_IPS= \
     TLSGOST_MAX_CONN=200 \
     TLSGOST_HANDSHAKE_TIMEOUT=30 \
+    TLSGOST_SNIFF_TIMEOUT=10 \
     TLSGOST_TIMEOUT=15 \
     TLSGOST_IDLE_TIMEOUT=300 \
     TLSGOST_AUTH_FAIL_LIMIT=5 \
@@ -56,11 +62,13 @@ ENV TLSGOST_HOST=0.0.0.0 \
     TLSGOST_ALLOW_NOAUTH=false \
     TLSGOST_FORCE_IPV4=true
 
-EXPOSE 8443
+# Expose port (follows TLSGOST_PORT above)
+EXPOSE ${TLSGOST_PORT}
 
 COPY tlsgost-healthcheck.sh /app/tlsgost-healthcheck.sh
 RUN chmod +x /app/tlsgost-healthcheck.sh
 
+# Health check - full TLS handshake + auth + egress-policy probe
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD /app/tlsgost-healthcheck.sh || exit 1
 

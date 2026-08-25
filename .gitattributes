@@ -1,0 +1,7 @@
+# Shell scripts and container files must keep LF endings — CRLF breaks
+# shebang parsing inside Linux images (bad interpreter) and Dockerfile parsing.
+*.sh              text eol=lf
+Dockerfile*       text eol=lf
+docker-compose*   text eol=lf
+go.mod            text eol=lf
+go.sum            text eol=lf

@@ -1,7 +1,11 @@
-version: '3.8'
-
 # Multi-protocol proxy service configuration
-# Includes SOCKS5, HTTP, GOST multi-protocol proxy, and WSGOST WebSocket bridge
+# Includes SOCKS5, HTTP, GOST multi-protocol proxy, and Metrics Gateway bridge
+#
+# SECURITY: all credentials come from the environment / a local .env file
+# (copy .env.example to .env and fill in strong random values). Deployment
+# fails fast with a clear error if a required variable is unset.
+# Ports bind to localhost by default; expose externally only behind a TLS
+# terminator or firewall rule you control.
 
 services:
   # SOCKS5 Proxy Service (Port 1080)
@@ -12,16 +16,20 @@ services:
     image: proxy:socks5
     container_name: proxy-socks5
     ports:
-      - "1080:1080"
+      - "127.0.0.1:1080:1080"
     environment:
       - SOCKS5_HOST=0.0.0.0
       - SOCKS5_PORT=1080
-      - SOCKS5_USER=testuser
-      - SOCKS5_PASS=testpass
+      - SOCKS5_USER=${SOCKS5_USER:?Set SOCKS5_USER in .env (see .env.example)}
+      - SOCKS5_PASS=${SOCKS5_PASS:?Set SOCKS5_PASS in .env (see .env.example)}
       - SOCKS5_MAX_CONN=50
       - SOCKS5_TIMEOUT=30
       - SOCKS5_IDLE_TIMEOUT=300
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 1080)); s.close()"]
       interval: 30s
@@ -39,14 +47,18 @@ services:
     image: proxy:http-proxy
     container_name: proxy-http
     ports:
-      - "8081:8080"  # Changed from 8080 to avoid conflict with GOST
+      - "127.0.0.1:8081:8080"  # Changed from 8080 to avoid conflict with GOST
     environment:
       - HTTP_PROXY_HOST=0.0.0.0
       - HTTP_PROXY_PORT=8080
-      - HTTP_PROXY_USER=testuser
-      - HTTP_PROXY_PASS=testpass
+      - HTTP_PROXY_USER=${HTTP_PROXY_USER:?Set HTTP_PROXY_USER in .env (see .env.example)}
+      - HTTP_PROXY_PASS=${HTTP_PROXY_PASS:?Set HTTP_PROXY_PASS in .env (see .env.example)}
       - HTTP_MAX_CONN=50
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 8080)); s.close()"]
       interval: 30s
@@ -65,13 +77,13 @@ services:
     image: proxy:gost-multi
     container_name: proxy-gost
     ports:
-      - "8080:8080"  # Single port for multiple protocols
+      - "127.0.0.1:8080:8080"  # Single port for multiple protocols
     environment:
       - GOST_HOST=0.0.0.0
       - GOST_PORT=8080
-      - GOST_USER=testuser
-      - GOST_PASS=testpass
-      - GOST_SS_KEY=your-shadowsocks-password
+      - GOST_USER=${GOST_USER:?Set GOST_USER in .env (see .env.example)}
+      - GOST_PASS=${GOST_PASS:?Set GOST_PASS in .env (see .env.example)}
+      - GOST_SS_KEY=${GOST_SS_KEY:?Set GOST_SS_KEY in .env (see .env.example)}
       - GOST_SS_CIPHER=aes-256-gcm
       - GOST_MAX_CONN=200
       - GOST_TIMEOUT=15
@@ -81,6 +93,12 @@ services:
       - GOST_ALLOW_NOAUTH=false
       - GOST_FORCE_IPV4=true
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    pids_limit: 512
     healthcheck:
       test: ["/app/gost-proxy-healthcheck.sh"]
       interval: 30s
@@ -100,12 +118,16 @@ services:
     image: proxy:metrics-gateway
     container_name: proxy-metrics
     ports:
-      - "8082:8080"   # host:8082 → container:8080 (avoids conflict with gost-proxy above)
+      - "127.0.0.1:8082:8080"   # host:8082 → container:8080 (avoids conflict with gost-proxy above)
     environment:
-      - SERVICE_TOKEN=your-uuid-here
+      - SERVICE_TOKEN=${SERVICE_TOKEN:?Set SERVICE_TOKEN in .env (see .env.example)}
       - SERVICE_PORT=8080
       - SERVICE_ENDPOINT=/api/v1/metrics
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "/app/service-healthcheck.sh"]
       interval: 30s
